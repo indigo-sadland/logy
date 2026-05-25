@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ func Load(path string) (Config, error) {
 	}
 
 	cfg.applyDefaults()
+	cfg.resolveRelativePaths(path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -89,6 +91,17 @@ func (c *Config) applyDefaults() {
 	if c.Resolver.Timeout == "" {
 		c.Resolver.Timeout = "4s"
 	}
+}
+
+// resolveRelativePaths anchors portable config values to the config file
+// directory instead of the caller's current working directory. This keeps demo
+// fixtures and shared configs stable across shells and operating systems.
+func (c *Config) resolveRelativePaths(configPath string) {
+	baseDir := filepath.Dir(strings.TrimSpace(configPath))
+	if baseDir == "" || baseDir == "." {
+		return
+	}
+	c.Database.Path = resolveConfigRelativePath(baseDir, c.Database.Path)
 }
 
 func (c Config) Validate() error {
@@ -181,4 +194,12 @@ func (c DiscoveryConfig) toolConfig(name string) (DiscoveryToolConfig, bool) {
 		}
 	}
 	return DiscoveryToolConfig{}, false
+}
+
+func resolveConfigRelativePath(baseDir string, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(baseDir, value)
 }

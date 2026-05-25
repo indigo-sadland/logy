@@ -9,7 +9,6 @@ import (
 	"github.com/indigo-sadland/logy/internal/modules/exporter"
 	"github.com/indigo-sadland/logy/internal/storage"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -118,6 +117,7 @@ func runExportAnytype(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+	opts.DatabasePath = cfg.Database.Path
 
 	store, err := storage.Open(cfg.Database.Path)
 	if err != nil {
@@ -150,8 +150,6 @@ func runExportAnytype(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	runs = resolveCommandRunTranscriptPaths(runs, cfg.Database.Path)
-
 	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, runs)
 	if err != nil {
 		return err
@@ -226,29 +224,6 @@ func confirmAnytypeExport(preview exporter.AnytypePreview) error {
 		return fmt.Errorf("export cancelled")
 	}
 	return nil
-}
-
-// resolveCommandRunTranscriptPaths keeps example fixtures and portable datasets
-// self-contained by treating non-absolute transcript paths as relative to the
-// SQLite database file location. Existing absolute paths are preserved.
-func resolveCommandRunTranscriptPaths(runs []storage.CommandRunRecord, databasePath string) []storage.CommandRunRecord {
-	if len(runs) == 0 {
-		return runs
-	}
-	baseDir := filepath.Dir(strings.TrimSpace(databasePath))
-	if baseDir == "" || baseDir == "." {
-		return runs
-	}
-	out := make([]storage.CommandRunRecord, len(runs))
-	copy(out, runs)
-	for i := range out {
-		path := strings.TrimSpace(out[i].TranscriptPath)
-		if path == "" || filepath.IsAbs(path) {
-			continue
-		}
-		out[i].TranscriptPath = filepath.Join(baseDir, path)
-	}
-	return out
 }
 
 func envOrDefault(key string, fallback string) string {

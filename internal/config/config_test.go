@@ -48,6 +48,36 @@ resolver:
 	}
 }
 
+func TestLoadResolvesRelativeDatabasePathAgainstConfigDirectory(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+database:
+  path: demo.db
+discovery:
+  tools:
+    - subfinder
+resolver:
+  binary: dnsx
+  workers: 10
+  timeout: 4s
+`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	want := filepath.Join(dir, "demo.db")
+	if cfg.Database.Path != want {
+		t.Fatalf("database.path=%q; want %q", cfg.Database.Path, want)
+	}
+}
+
 func TestDiscoveryEnabledToolsHonorsDisabledFlag(t *testing.T) {
 	t.Parallel()
 

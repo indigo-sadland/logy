@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 type AnytypeOptions struct {
 	Domain           string
 	EngagementName   string
+	DatabasePath     string
 	SpaceID          string
 	BaseURL          string
 	Token            string
@@ -219,9 +221,9 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		}
 		if existing != nil {
 			if opts.DebugScanPayload {
-				logAnytypeScanPayload(http.MethodPatch, "/v1/spaces/"+opts.SpaceID+"/objects/"+existing.ID, anytypeUpdateObjectRequest{Markdown: mustCommandRunMarkdown(run)})
+				logAnytypeScanPayload(http.MethodPatch, "/v1/spaces/"+opts.SpaceID+"/objects/"+existing.ID, anytypeUpdateObjectRequest{Markdown: mustCommandRunMarkdown(run, opts.DatabasePath)})
 			}
-			updated, err := client.updateScanBody(ctx, existing.ID, run)
+			updated, err := client.updateScanBody(ctx, existing.ID, run, opts.DatabasePath)
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("update Anytype scan body for command run %d: %w", run.ID, err)
 			}
@@ -232,7 +234,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			skippedScans++
 			continue
 		}
-		markdown, err := commandRunMarkdown(run)
+		markdown, err := commandRunMarkdown(run, opts.DatabasePath)
 		if err != nil {
 			return AnytypeResult{}, fmt.Errorf("build Anytype scan body for command run %d: %w", run.ID, err)
 		}
@@ -322,6 +324,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.Domain = strings.TrimSpace(opts.Domain)
 	opts.EngagementName = strings.TrimSpace(opts.EngagementName)
+	opts.DatabasePath = strings.TrimSpace(opts.DatabasePath)
 	opts.SpaceID = strings.TrimSpace(opts.SpaceID)
 	opts.BaseURL = strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
 	opts.Token = strings.TrimSpace(opts.Token)
@@ -596,8 +599,8 @@ func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, com
 
 // updateScanBody patches the object markdown for an existing Scan so rerunning
 // export corrects older objects that stored command output in the wrong place.
-func (c anytypeClient) updateScanBody(ctx context.Context, id string, run storage.CommandRunRecord) (bool, error) {
-	markdown, err := commandRunMarkdown(run)
+func (c anytypeClient) updateScanBody(ctx context.Context, id string, run storage.CommandRunRecord, databasePath string) (bool, error) {
+	markdown, err := commandRunMarkdown(run, databasePath)
 	if err != nil {
 		return false, err
 	}
@@ -926,8 +929,8 @@ func commandRunStartedAt(run storage.CommandRunRecord) string {
 	return run.StartedAt.UTC().Format(time.RFC3339)
 }
 
-func commandRunTranscriptText(run storage.CommandRunRecord) (string, bool, error) {
-	path := strings.TrimSpace(run.TranscriptPath)
+func commandRunTranscriptText(run storage.CommandRunRecord, databasePath string) (string, bool, error) {
+	path := resolveTranscriptPath(run, databasePath)
 	if path == "" {
 		return "", false, nil
 	}
@@ -941,8 +944,8 @@ func commandRunTranscriptText(run storage.CommandRunRecord) (string, bool, error
 // commandRunMarkdown renders the recorded terminal session as a fenced code
 // block in the object's markdown body. Four backticks are used so the export
 // remains valid even when the transcript itself contains triple-backtick text.
-func commandRunMarkdown(run storage.CommandRunRecord) (string, error) {
-	output, ok, err := commandRunTranscriptText(run)
+func commandRunMarkdown(run storage.CommandRunRecord, databasePath string) (string, error) {
+	output, ok, err := commandRunTranscriptText(run, databasePath)
 	if err != nil {
 		return "", err
 	}
@@ -956,11 +959,26 @@ func commandRunMarkdown(run storage.CommandRunRecord) (string, error) {
 	return "````text\n" + output + "\n````", nil
 }
 
+func resolveTranscriptPath(run storage.CommandRunRecord, databasePath string) string {
+	path := strings.TrimSpace(run.TranscriptPath)
+	if path == "" {
+		return ""
+	}
+	if filepath.IsAbs(path) {
+		return path
+	}
+	baseDir := filepath.Dir(strings.TrimSpace(databasePath))
+	if baseDir == "" || baseDir == "." {
+		return path
+	}
+	return filepath.Join(baseDir, path)
+}
+
 // mustCommandRunMarkdown is used only for debug logging. Export still performs
 // the real error handling on the main path; this helper just keeps the debug
 // payload printable even when transcript rendering fails.
-func mustCommandRunMarkdown(run storage.CommandRunRecord) string {
-	markdown, err := commandRunMarkdown(run)
+func mustCommandRunMarkdown(run storage.CommandRunRecord, databasePath string) string {
+	markdown, err := commandRunMarkdown(run, databasePath)
 	if err != nil {
 		return "logy debug: failed to render transcript markdown: " + err.Error()
 	}

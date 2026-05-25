@@ -1,0 +1,14 @@
+database:
+  path: demo.db
+
+discovery:
+  tools:
+    - subfinder
+  tool_config:
+    subfinder:
+      enabled: true
+
+resolver:
+  binary: dnsx
+  workers: 25
+  timeout: 4s

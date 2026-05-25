@@ -126,7 +126,7 @@ func TestCommandRunTranscriptTextReadsRecordedOutput(t *testing.T) {
 		t.Fatalf("write transcript: %v", err)
 	}
 
-	got, ok, err := commandRunTranscriptText(storage.CommandRunRecord{TranscriptPath: path})
+	got, ok, err := commandRunTranscriptText(storage.CommandRunRecord{TranscriptPath: path}, "")
 	if err != nil {
 		t.Fatalf("commandRunTranscriptText: %v", err)
 	}
@@ -147,11 +147,33 @@ func TestCommandRunMarkdownWrapsTranscriptInCodeFence(t *testing.T) {
 	run := storage.CommandRunRecord{
 		TranscriptPath: path,
 	}
-	markdown, err := commandRunMarkdown(run)
+	markdown, err := commandRunMarkdown(run, "")
 	if err != nil {
 		t.Fatalf("commandRunMarkdown: %v", err)
 	}
 	want := "````text\ncaptured output\n````"
+	if markdown != want {
+		t.Fatalf("markdown=%q; want %q", markdown, want)
+	}
+}
+
+func TestCommandRunMarkdownResolvesRelativePathAgainstDatabaseDirectory(t *testing.T) {
+	dir := t.TempDir()
+	transcriptDir := filepath.Join(dir, "transcripts")
+	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	path := filepath.Join(transcriptDir, "session.typescript")
+	if err := os.WriteFile(path, []byte("portable output"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	run := storage.CommandRunRecord{TranscriptPath: filepath.Join("transcripts", "session.typescript")}
+	markdown, err := commandRunMarkdown(run, filepath.Join(dir, "demo.db"))
+	if err != nil {
+		t.Fatalf("commandRunMarkdown: %v", err)
+	}
+	want := "````text\nportable output\n````"
 	if markdown != want {
 		t.Fatalf("markdown=%q; want %q", markdown, want)
 	}
