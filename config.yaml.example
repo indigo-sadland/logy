@@ -1,0 +1,36 @@
+database:
+  path: /path/to/logy.db
+
+discovery:
+  tools:
+    - subfinder
+    - amass
+    - findomain
+    - bufferover
+    - ripestat
+    - puredns
+  tool_config:
+    amass:
+      enabled: true
+      resolvers_file: "/path/to/resolvers/file"
+      config_file: "/path/to/config/file"
+    subfinder:
+      enabled: true
+      config_file:
+    findomain:
+      enabled: true
+    bufferover:
+      enabled: true
+      # Prefer `logy secrets set bufferover`; this plaintext fallback remains supported.
+      api_key: ""
+      base_url: "https://tls.bufferover.run/dns"
+    ripestat:
+      enabled: false
+    puredns:
+      enabled: true
+
+resolver:
+  binary: dnsx
+  workers: 100
+  timeout: 4s
+  resolvers_file: "/path/to/resolvers/file"
