@@ -1,7 +1,7 @@
 This fixture is a self-contained dataset for checking Anytype export behavior.
 
 Files:
-- `config.yaml`: points `logy` at the demo SQLite database
+- `config_demo.yaml`: points `logy` at the demo SQLite database. Update the path so it matches your environment.
 - `demo.db`: generated from `seed.sql`
 - `transcripts/nmap-demo.typescript`: sample `holdmy exec --record-output` transcript linked to a command run
 

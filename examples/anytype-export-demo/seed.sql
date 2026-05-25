@@ -123,6 +123,6 @@ INSERT INTO web_probes (domain, target, url, final_url, scheme, port, status_cod
 ('demo.example', 'admin.demo.example', 'https://admin.demo.example:8443', 'https://admin.demo.example:8443/', 'https', 8443, 401, 'Admin Console', 'caddy,go', '2026-05-24T17:37:00Z');
 
 INSERT INTO command_runs (domain, target, tool, command, wordlist, status, started_at, finished_at, exit_code, notes, transcript_path, transcript_bytes, transcript_mode) VALUES
-('demo.example', '10.20.30.40', 'nmap', 'nmap -Pn -sV 10.20.30.40', '', 'completed', '2026-05-24T17:14:11Z', '2026-05-24T17:14:18Z', 0, 'Baseline service census with transcript capture enabled', '/home/crashout/Dev/logy/examples/anytype-export-demo/transcripts/nmap-demo.typescript', 668, 'pty-script'),
+('demo.example', '10.20.30.40', 'nmap', 'nmap -Pn -sV 10.20.30.40', '', 'completed', '2026-05-24T17:14:11Z', '2026-05-24T17:14:18Z', 0, 'Baseline service census with transcript capture enabled', 'transcripts/nmap-demo.typescript', 668, 'pty-script'),
 ('demo.example', 'https://app.demo.example/FUZZ', 'ffuf', 'ffuf -u https://app.demo.example/FUZZ -w raft-small-words.txt -mc all', 'raft-small-words.txt', 'completed', '2026-05-24T17:45:00Z', '2026-05-24T17:52:13Z', 0, 'Content discovery against app.demo.example', '', NULL, ''),
 ('demo.example', '10.20.30.41', 'curl', 'curl -ki https://admin.demo.example:8443/', '', 'failed', '2026-05-24T18:05:00Z', '2026-05-24T18:05:07Z', 35, 'TLS handshake check against admin interface', '', NULL, '');
