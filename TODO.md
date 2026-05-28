@@ -1,4 +1,4 @@
 - [ ] Remove reading bufferover API from config.yaml fallback;
 - [X] Remove old code base for ffuf
-- [X] Add functionality to run nmap on one target from db data.
+- [X] Add functionality to run nmap on one selected target from db data.
 - [ ] Decide how to export httpx probe info into anytype

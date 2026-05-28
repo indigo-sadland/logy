@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/indigo-sadland/logy/internal/config"
 	"github.com/indigo-sadland/logy/internal/modules/exporter"
 	"github.com/indigo-sadland/logy/internal/storage"
-	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -55,6 +56,7 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetTypeKey, "asset-type", "asset", "Anytype type key for Asset objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceTypeKey, "service-type", "service", "Anytype type key for Service objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ScanTypeKey, "scan-type", "scan", "Anytype type key for Scan objects")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceHistoricalObservationTypeKey, "service-historical-observation-type", "historical_observation", "Anytype type key for Service historical observation objects")
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "Anytype property key for Asset aliases")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementPropertyKey, "engagement-property", "engagement", "Anytype property key for Engagement object links")
@@ -66,6 +68,13 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ScanStatusPropertyKey, "scan-status-property", "scan_status", "Anytype select property key for Scan status")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.TimestampPropertyKey, "timestamp-property", "timestamp", "Anytype text property key for Scan start timestamp")
 
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationServiceLinkPropertyKey, "service-historical-observation-service-link-property", "service_link", "Anytype property key for historical observation service link")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationPortPropertyKey, "service-historical-observation-port-property", "port", "Anytype property key for historical observation port")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationObservedStatePropertyKey, "service-historical-observation-state-property", "observed_state", "Anytype property key for historical observation state")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationObservedBannerPropertyKey, "service-historical-observation-banner-property", "observed_banner", "Anytype property key for historical observation banner")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationObservedServicePropertyKey, "service-historical-observation-service-property", "observed_service", "Anytype property key for historical observation service")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationTimestampPropertyKey, "service-historical-observation-timestamp-property", "timestamp", "Anytype property key for historical observation timestamp")
+
 	hideAnytypeAdvancedFlags(exportAnytypeCmd)
 }
 
@@ -75,6 +84,7 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"asset-type",
 		"service-type",
 		"scan-type",
+		"service-historical-observation-type",
 		"alias-property",
 		"engagement-property",
 		"asset-property",
@@ -84,6 +94,13 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"banner-property",
 		"scan-status-property",
 		"timestamp-property",
+		"service-historical-observation-name-property",
+		"service-historical-observation-service-link-property",
+		"service-historical-observation-port-property",
+		"service-historical-observation-state-property",
+		"service-historical-observation-banner-property",
+		"service-historical-observation-service-property",
+		"service-historical-observation-timestamp-property",
 	} {
 		_ = cmd.Flags().MarkHidden(name)
 	}
@@ -150,7 +167,16 @@ func runExportAnytype(cmd *cobra.Command) error {
 			return err
 		}
 	}
-	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, runs)
+	// Historical observations are optional; older domains may not have any yet.
+	observations, err := store.ServiceHistoricalObservationsByDomain(opts.Domain)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			observations = nil
+		} else {
+			return err
+		}
+	}
+	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, runs)
 	if err != nil {
 		return err
 	}
@@ -160,39 +186,43 @@ func runExportAnytype(cmd *cobra.Command) error {
 		}
 	}
 
-	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, runs)
+	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, runs)
 	if err != nil {
 		return err
 	}
 
 	summary := struct {
-		Domain          string `json:"domain"`
-		Engagement      string `json:"engagement"`
-		EngagementID    string `json:"engagement_id"`
-		Database        string `json:"database"`
-		AssetsCreated   int    `json:"assets_created"`
-		AssetsReused    int    `json:"assets_reused"`
-		AssetsUpdated   int    `json:"assets_updated"`
-		ServicesCreated int    `json:"services_created"`
-		ServicesReused  int    `json:"services_reused"`
-		ScansCreated    int    `json:"scans_created"`
-		ScansSkipped    int    `json:"scans_skipped"`
-		AnytypeSpace    string `json:"anytype_space"`
-		AnytypeURL      string `json:"anytype_url"`
+		Domain                               string `json:"domain"`
+		Engagement                           string `json:"engagement"`
+		EngagementID                         string `json:"engagement_id"`
+		Database                             string `json:"database"`
+		AssetsCreated                        int    `json:"assets_created"`
+		AssetsReused                         int    `json:"assets_reused"`
+		AssetsUpdated                        int    `json:"assets_updated"`
+		ServicesCreated                      int    `json:"services_created"`
+		ServicesReused                       int    `json:"services_reused"`
+		ServiceHistoricalObservationsCreated int    `json:"service_historical_observations_created"`
+		ServiceHistoricalObservationsSkipped int    `json:"service_historical_observations_skipped"`
+		ScansCreated                         int    `json:"scans_created"`
+		ScansSkipped                         int    `json:"scans_skipped"`
+		AnytypeSpace                         string `json:"anytype_space"`
+		AnytypeURL                           string `json:"anytype_url"`
 	}{
-		Domain:          result.Domain,
-		Engagement:      result.Engagement,
-		EngagementID:    result.EngagementID,
-		Database:        cfg.Database.Path,
-		AssetsCreated:   result.AssetsCreated,
-		AssetsReused:    result.AssetsReused,
-		AssetsUpdated:   result.AssetsUpdated,
-		ServicesCreated: result.ServicesCreated,
-		ServicesReused:  result.ServicesReused,
-		ScansCreated:    result.ScansCreated,
-		ScansSkipped:    result.ScansSkipped,
-		AnytypeSpace:    result.AnytypeSpace,
-		AnytypeURL:      result.AnytypeURL,
+		Domain:                               result.Domain,
+		Engagement:                           result.Engagement,
+		EngagementID:                         result.EngagementID,
+		Database:                             cfg.Database.Path,
+		AssetsCreated:                        result.AssetsCreated,
+		AssetsReused:                         result.AssetsReused,
+		AssetsUpdated:                        result.AssetsUpdated,
+		ServicesCreated:                      result.ServicesCreated,
+		ServicesReused:                       result.ServicesReused,
+		ServiceHistoricalObservationsCreated: result.ServiceHistoricalObservationsCreated,
+		ServiceHistoricalObservationsSkipped: result.ServiceHistoricalObservationsSkipped,
+		ScansCreated:                         result.ScansCreated,
+		ScansSkipped:                         result.ScansSkipped,
+		AnytypeSpace:                         result.AnytypeSpace,
+		AnytypeURL:                           result.AnytypeURL,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
@@ -215,6 +245,7 @@ func confirmAnytypeExport(preview exporter.AnytypePreview) error {
 	fmt.Fprintf(os.Stderr, "  url:           %s\n", preview.AnytypeURL)
 	fmt.Fprintf(os.Stderr, "  assets:        %d\n", preview.Assets)
 	fmt.Fprintf(os.Stderr, "  services:      %d\n", preview.Services)
+	fmt.Fprintf(os.Stderr, "  history:       %d\n", preview.ServiceHistoricalObservations)
 	fmt.Fprintf(os.Stderr, "  scans:         %d\n", preview.Scans)
 	answer, err := promptLine("Proceed with export? [y/N]: ")
 	if err != nil {

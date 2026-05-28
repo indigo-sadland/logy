@@ -39,6 +39,20 @@ CREATE TABLE IF NOT EXISTS port_scans (
     UNIQUE(domain, ip, port, protocol)
 );
 
+CREATE TABLE IF NOT EXISTS service_historical_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    host_ip TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    observed_state TEXT NOT NULL,
+    observed_banner TEXT NOT NULL DEFAULT '',
+    observed_service TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS web_probes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -117,6 +131,12 @@ INSERT INTO port_scans (domain, ip, port, protocol, state, service, version, sca
 ('demo.example', '10.20.30.40', 443, 'tcp', 'open', 'https', 'nginx 1.27.0', '2026-05-24T17:14:18Z'),
 ('demo.example', '10.20.30.41', 8443, 'tcp', 'open', 'https', 'Caddy 2.9.1', '2026-05-24T17:20:31Z'),
 ('demo.example', '172.16.10.50', 3389, 'tcp', 'open', 'ms-wbt-server', 'Microsoft Terminal Services', '2026-05-24T17:25:41Z');
+
+INSERT INTO service_historical_observations (domain, host_ip, hostname, port, protocol, observed_state, observed_banner, observed_service, observed_at, source) VALUES
+('demo.example', '10.20.30.40', 'api.demo.example', 443, 'tcp', 'open', 'envoy 1.31.2', 'https', '2026-05-24T19:12:44Z', 'operator-b'),
+('demo.example', '10.20.30.40', 'api.demo.example', 80, 'tcp', 'open', 'Apache httpd 2.4.62', 'http', '2026-05-24T19:13:05Z', 'operator-b'),
+('demo.example', '10.20.30.41', 'admin.demo.example', 8443, 'tcp', 'open', 'Caddy 2.10.0', 'https', '2026-05-24T19:21:19Z', 'operator-b'),
+('demo.example', '172.16.10.50', '', 3389, 'tcp', 'filtered', 'no banner captured from RDP handshake', 'ms-wbt-server', '2026-05-24T19:33:42Z', 'operator-b');
 
 INSERT INTO web_probes (domain, target, url, final_url, scheme, port, status_code, title, technologies, probed_at) VALUES
 ('demo.example', 'app.demo.example', 'https://app.demo.example', 'https://app.demo.example/login', 'https', 443, 200, 'Demo Login', 'nginx,react', '2026-05-24T17:35:00Z'),

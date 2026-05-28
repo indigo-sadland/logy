@@ -103,6 +103,108 @@ func TestAnytypeServiceObjectNamesIncludesAliasAndIPFallback(t *testing.T) {
 	}
 }
 
+func TestAnytypeHistoricalObservationNameUsesServiceNameAndTimestamp(t *testing.T) {
+	observation := storage.ServiceHistoricalObservationRecord{
+		ObservedAt: time.Date(2026, 5, 24, 19, 12, 44, 0, time.UTC),
+	}
+
+	got := anytypeHistoricalObservationName(observation, "443 HTTPS - api.demo.example")
+	want := "443 HTTPS - api.demo.example @ 2026-05-24T19:12:44Z"
+	if got != want {
+		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestAnytypeHistoricalObservationNameFallsBackToObservationShape(t *testing.T) {
+	observation := storage.ServiceHistoricalObservationRecord{
+		HostIP:          "172.16.10.50",
+		Port:            3389,
+		Protocol:        "tcp",
+		ObservedService: "ms-wbt-server",
+		ObservedAt:      time.Date(2026, 5, 24, 19, 33, 42, 0, time.UTC),
+	}
+
+	got := anytypeHistoricalObservationName(observation, "")
+	want := "3389 MS-WBT-SERVER - 172.16.10.50 @ 2026-05-24T19:33:42Z"
+	if got != want {
+		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestCollidesWithCurrentServiceMatchesStateServiceOrBannerChanges(t *testing.T) {
+	scans := []storage.PortScanRecord{{
+		IP:       "10.20.30.40",
+		Port:     443,
+		Protocol: "tcp",
+		State:    "open",
+		Service:  "https",
+		Version:  "nginx 1.27.0",
+	}}
+
+	tests := []struct {
+		name        string
+		observation storage.ServiceHistoricalObservationRecord
+		want        bool
+	}{
+		{
+			name: "same values",
+			observation: storage.ServiceHistoricalObservationRecord{
+				HostIP:          "10.20.30.40",
+				Port:            443,
+				Protocol:        "tcp",
+				ObservedState:   "open",
+				ObservedService: "https",
+				ObservedBanner:  "nginx 1.27.0",
+			},
+			want: false,
+		},
+		{
+			name: "banner changed",
+			observation: storage.ServiceHistoricalObservationRecord{
+				HostIP:          "10.20.30.40",
+				Port:            443,
+				Protocol:        "tcp",
+				ObservedState:   "open",
+				ObservedService: "https",
+				ObservedBanner:  "envoy 1.31.2",
+			},
+			want: true,
+		},
+		{
+			name: "state changed",
+			observation: storage.ServiceHistoricalObservationRecord{
+				HostIP:          "10.20.30.40",
+				Port:            443,
+				Protocol:        "tcp",
+				ObservedState:   "filtered",
+				ObservedService: "https",
+				ObservedBanner:  "nginx 1.27.0",
+			},
+			want: true,
+		},
+		{
+			name: "no current service match",
+			observation: storage.ServiceHistoricalObservationRecord{
+				HostIP:          "10.20.30.99",
+				Port:            443,
+				Protocol:        "tcp",
+				ObservedState:   "open",
+				ObservedService: "https",
+				ObservedBanner:  "nginx 1.27.0",
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := collidesWithCurrentService(tt.observation, scans); got != tt.want {
+				t.Fatalf("collides=%t; want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestObjectLinkedToEngagementVerifiesRelationWhenPresent(t *testing.T) {
 	object := map[string]any{
 		"properties": []any{

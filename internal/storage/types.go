@@ -73,6 +73,19 @@ type PortScanRecord struct {
 	ScannedAt time.Time
 }
 
+type ServiceHistoricalObservationRecord struct {
+	Domain          string
+	HostIP          string
+	Hostname        string
+	Port            int
+	Protocol        string
+	ObservedState   string
+	ObservedBanner  string
+	ObservedService string
+	ObservedAt      time.Time
+	Source          string
+}
+
 type WebProbeRecord struct {
 	Domain       string
 	Target       string

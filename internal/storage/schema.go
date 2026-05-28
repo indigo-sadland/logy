@@ -8,6 +8,10 @@ func (s *Store) init() error {
 	if err != nil {
 		return err
 	}
+	// Keep older databases usable when they predate historical observations.
+	if err := s.migrateServiceHistoricalObservationsSchema(); err != nil {
+		return err
+	}
 	return s.migrateCommandRunsSchema()
 }
 
@@ -49,6 +53,20 @@ CREATE TABLE IF NOT EXISTS port_scans (
     version TEXT NOT NULL DEFAULT '',
     scanned_at TEXT NOT NULL,
     UNIQUE(domain, ip, port, protocol)
+);
+
+CREATE TABLE IF NOT EXISTS service_historical_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    host_ip TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    observed_state TEXT NOT NULL,
+    observed_banner TEXT NOT NULL DEFAULT '',
+    observed_service TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS web_probes (
@@ -114,6 +132,28 @@ CREATE TABLE IF NOT EXISTS finding_services (
     service TEXT NOT NULL DEFAULT ''
 );
 `
+
+// migrateServiceHistoricalObservationsSchema adds the append-only service
+// observation table for databases created before historical export support
+// existed.
+func (s *Store) migrateServiceHistoricalObservationsSchema() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS service_historical_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    host_ip TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'tcp',
+    observed_state TEXT NOT NULL,
+    observed_banner TEXT NOT NULL DEFAULT '',
+    observed_service TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT ''
+)
+`)
+	return err
+}
 
 // migrateCommandRunsSchema adds transcript metadata columns for existing
 // databases created before terminal recording support existed. New databases

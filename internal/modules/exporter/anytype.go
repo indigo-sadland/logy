@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/indigo-sadland/logy/internal/storage"
 	"io"
 	"net/http"
 	"os"
@@ -14,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/indigo-sadland/logy/internal/storage"
 )
 
 // AnytypeOptions contains connection settings plus Anytype type/property keys
@@ -28,48 +29,59 @@ type AnytypeOptions struct {
 	Version          string
 	DebugScanPayload bool
 
-	EngagementTypeKey string
-	AssetTypeKey      string
-	ServiceTypeKey    string
-	ScanTypeKey       string
+	EngagementTypeKey                   string
+	AssetTypeKey                        string
+	ServiceTypeKey                      string
+	ScanTypeKey                         string
+	ServiceHistoricalObservationTypeKey string
 
-	AliasPropertyKey      string
-	EngagementPropertyKey string
-	AssetPropertyKey      string
-	PortPropertyKey       string
-	StatePropertyKey      string
-	ServicePropertyKey    string
-	BannerPropertyKey     string
-	ScanStatusPropertyKey string
-	TimestampPropertyKey  string
+	AliasPropertyKey                                string
+	EngagementPropertyKey                           string
+	AssetPropertyKey                                string
+	PortPropertyKey                                 string
+	StatePropertyKey                                string
+	ServicePropertyKey                              string
+	BannerPropertyKey                               string
+	ScanStatusPropertyKey                           string
+	TimestampPropertyKey                            string
+	HistoricalObservationNamePropertyKey            string
+	HistoricalObservationServiceLinkPropertyKey     string
+	HistoricalObservationPortPropertyKey            string
+	HistoricalObservationObservedStatePropertyKey   string
+	HistoricalObservationObservedBannerPropertyKey  string
+	HistoricalObservationObservedServicePropertyKey string
+	HistoricalObservationTimestampPropertyKey       string
 }
 
 // AnytypeResult summarizes the objects created during an Anytype export run.
 type AnytypeResult struct {
-	Domain          string
-	Engagement      string
-	EngagementID    string
-	AssetsCreated   int
-	AssetsReused    int
-	AssetsUpdated   int
-	ServicesCreated int
-	ServicesReused  int
-	ScansCreated    int
-	ScansSkipped    int
-	AnytypeSpace    string
-	AnytypeURL      string
+	Domain                               string
+	Engagement                           string
+	EngagementID                         string
+	AssetsCreated                        int
+	AssetsReused                         int
+	AssetsUpdated                        int
+	ServicesCreated                      int
+	ServicesReused                       int
+	ServiceHistoricalObservationsCreated int
+	ServiceHistoricalObservationsSkipped int
+	ScansCreated                         int
+	ScansSkipped                         int
+	AnytypeSpace                         string
+	AnytypeURL                           string
 }
 
 // AnytypePreview describes what an export would write before creating objects.
 type AnytypePreview struct {
-	Domain       string
-	Engagement   string
-	EngagementID string
-	Assets       int
-	Services     int
-	Scans        int
-	AnytypeSpace string
-	AnytypeURL   string
+	Domain                        string
+	Engagement                    string
+	EngagementID                  string
+	Assets                        int
+	Services                      int
+	ServiceHistoricalObservations int
+	Scans                         int
+	AnytypeSpace                  string
+	AnytypeURL                    string
 }
 
 type anytypeClient struct {
@@ -112,7 +124,7 @@ type anytypeObject struct {
 
 // ExportAnytype pushes saved subdomain and port scan state into Anytype.
 // It creates one Asset per IP address and one Service per saved port scan.
-func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
+func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypeResult{}, err
@@ -123,13 +135,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		return AnytypeResult{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
 
-	client := anytypeClient{
-		baseURL: opts.BaseURL,
-		spaceID: opts.SpaceID,
-		token:   opts.Token,
-		version: opts.Version,
-		client:  http.DefaultClient,
-	}
+	client := newAnytypeClient(opts)
 
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
@@ -156,12 +162,9 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		}
 
 		assetID, err := client.createObject(ctx, anytypeCreateObjectRequest{
-			TypeKey: opts.AssetTypeKey,
-			Name:    assets[i].IP,
-			Properties: []anytypeProperty{
-				textProperty(opts.AliasPropertyKey, strings.Join(assets[i].Aliases, ", ")),
-				objectsProperty(opts.EngagementPropertyKey, engagementID),
-			},
+			TypeKey:    opts.AssetTypeKey,
+			Name:       assets[i].IP,
+			Properties: anytypeAssetProperties(opts, engagementID, assets[i].Aliases),
 		})
 		if err != nil {
 			return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
@@ -179,36 +182,77 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 
 	createdServices := 0
 	reusedServices := 0
+	// Reuse the same service identity later when we attach historical evidence.
+	serviceIDByKey := make(map[string]string, len(scans))
+	serviceNameByKey := make(map[string]string, len(scans))
 	for _, scan := range scans {
 		assetID := assetIDByIP[scan.IP]
 		if assetID == "" {
 			continue
 		}
+		serviceKey := anytypeServiceObservationKey(scan.IP, scan.Port, scan.Protocol)
+		serviceName := anytypeServiceObjectName(scan, aliasesByIP[scan.IP])
 		exists, err := client.serviceExists(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
 		if err != nil {
 			return AnytypeResult{}, fmt.Errorf("search Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
 		}
 		if exists {
 			reusedServices++
+			existing, err := client.findObjectByExactName(ctx, opts.ServiceTypeKey, serviceName)
+			if err == nil && existing != nil {
+				serviceIDByKey[serviceKey] = existing.ID
+				serviceNameByKey[serviceKey] = serviceName
+			}
 			continue
 		}
 		serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
-			TypeKey: opts.ServiceTypeKey,
-			Name:    anytypeServiceObjectName(scan, aliasesByIP[scan.IP]),
-			Properties: []anytypeProperty{
-				textProperty(opts.PortPropertyKey, fmt.Sprintf("%d/%s", scan.Port, strings.ToLower(strings.TrimSpace(scan.Protocol)))),
-				textProperty(opts.StatePropertyKey, scan.State),
-				textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
-				textProperty(opts.BannerPropertyKey, scan.Version),
-				objectsProperty(opts.EngagementPropertyKey, engagementID),
-				objectsProperty(opts.AssetPropertyKey, assetID),
-			},
+			TypeKey:    opts.ServiceTypeKey,
+			Name:       serviceName,
+			Properties: anytypeServiceProperties(opts, engagementID, assetID, scan),
 		})
 		if err != nil {
 			return AnytypeResult{}, fmt.Errorf("create Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
 		}
 		if serviceID != "" {
 			createdServices++
+			serviceIDByKey[serviceKey] = serviceID
+			serviceNameByKey[serviceKey] = serviceName
+		}
+	}
+
+	createdHistorical := 0
+	skippedHistorical := 0
+	for _, observation := range observations {
+		// Historical observations only make sense when they point at a stable
+		// service object from the same export run.
+		serviceKey := anytypeServiceObservationKey(observation.HostIP, observation.Port, observation.Protocol)
+		serviceID := serviceIDByKey[serviceKey]
+		serviceName := serviceNameByKey[serviceKey]
+		if serviceID == "" || serviceName == "" {
+			continue
+		}
+		if !collidesWithCurrentService(observation, scans) {
+			continue
+		}
+		name := anytypeHistoricalObservationName(observation, serviceName)
+		exists, err := client.historicalObservationExists(ctx, opts.ServiceHistoricalObservationTypeKey, name, observation.ObservedAt, opts.HistoricalObservationTimestampPropertyKey)
+		if err != nil {
+			return AnytypeResult{}, fmt.Errorf("search Anytype service historical observation for %s: %w", name, err)
+		}
+		if exists {
+			skippedHistorical++
+			continue
+		}
+		observationID, err := client.createObject(ctx, anytypeCreateObjectRequest{
+			TypeKey:    opts.ServiceHistoricalObservationTypeKey,
+			Name:       name,
+			Properties: anytypeHistoricalObservationProperties(opts, engagementID, serviceID, observation),
+		})
+		if err != nil {
+			return AnytypeResult{}, fmt.Errorf("create Anytype service historical observation for %s: %w", name, err)
+		}
+		if observationID != "" {
+			createdHistorical++
 		}
 	}
 
@@ -257,23 +301,25 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	}
 
 	return AnytypeResult{
-		Domain:          opts.Domain,
-		Engagement:      opts.EngagementName,
-		EngagementID:    engagementID,
-		AssetsCreated:   createdAssets,
-		AssetsReused:    reusedAssets,
-		AssetsUpdated:   updatedAssets,
-		ServicesCreated: createdServices,
-		ServicesReused:  reusedServices,
-		ScansCreated:    createdScans,
-		ScansSkipped:    skippedScans,
-		AnytypeSpace:    opts.SpaceID,
-		AnytypeURL:      opts.BaseURL,
+		Domain:                               opts.Domain,
+		Engagement:                           opts.EngagementName,
+		EngagementID:                         engagementID,
+		AssetsCreated:                        createdAssets,
+		AssetsReused:                         reusedAssets,
+		AssetsUpdated:                        updatedAssets,
+		ServicesCreated:                      createdServices,
+		ServicesReused:                       reusedServices,
+		ServiceHistoricalObservationsCreated: createdHistorical,
+		ServiceHistoricalObservationsSkipped: skippedHistorical,
+		ScansCreated:                         createdScans,
+		ScansSkipped:                         skippedScans,
+		AnytypeSpace:                         opts.SpaceID,
+		AnytypeURL:                           opts.BaseURL,
 	}, nil
 }
 
 // PreviewAnytype resolves the target engagement and counts the objects that would be created without mutating Anytype.
-func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
+func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypePreview{}, err
@@ -284,13 +330,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 		return AnytypePreview{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
 
-	client := anytypeClient{
-		baseURL: opts.BaseURL,
-		spaceID: opts.SpaceID,
-		token:   opts.Token,
-		version: opts.Version,
-		client:  http.DefaultClient,
-	}
+	client := newAnytypeClient(opts)
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
 		return AnytypePreview{}, err
@@ -306,16 +346,24 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 			serviceCount++
 		}
 	}
+	historicalCount := 0
+	for _, observation := range observations {
+		// Preview only counts observations that would produce a new historical object.
+		if collidesWithCurrentService(observation, scans) {
+			historicalCount++
+		}
+	}
 
 	return AnytypePreview{
-		Domain:       opts.Domain,
-		Engagement:   opts.EngagementName,
-		EngagementID: engagementID,
-		Assets:       len(assets),
-		Services:     serviceCount,
-		Scans:        len(runs),
-		AnytypeSpace: opts.SpaceID,
-		AnytypeURL:   opts.BaseURL,
+		Domain:                        opts.Domain,
+		Engagement:                    opts.EngagementName,
+		EngagementID:                  engagementID,
+		Assets:                        len(assets),
+		Services:                      serviceCount,
+		ServiceHistoricalObservations: historicalCount,
+		Scans:                         len(runs),
+		AnytypeSpace:                  opts.SpaceID,
+		AnytypeURL:                    opts.BaseURL,
 	}, nil
 }
 
@@ -333,6 +381,7 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.AssetTypeKey = strings.TrimSpace(opts.AssetTypeKey)
 	opts.ServiceTypeKey = strings.TrimSpace(opts.ServiceTypeKey)
 	opts.ScanTypeKey = strings.TrimSpace(opts.ScanTypeKey)
+	opts.ServiceHistoricalObservationTypeKey = strings.TrimSpace(opts.ServiceHistoricalObservationTypeKey)
 	opts.AliasPropertyKey = strings.TrimSpace(opts.AliasPropertyKey)
 	opts.EngagementPropertyKey = strings.TrimSpace(opts.EngagementPropertyKey)
 	opts.AssetPropertyKey = strings.TrimSpace(opts.AssetPropertyKey)
@@ -342,6 +391,13 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.BannerPropertyKey = strings.TrimSpace(opts.BannerPropertyKey)
 	opts.ScanStatusPropertyKey = strings.TrimSpace(opts.ScanStatusPropertyKey)
 	opts.TimestampPropertyKey = strings.TrimSpace(opts.TimestampPropertyKey)
+	opts.HistoricalObservationNamePropertyKey = strings.TrimSpace(opts.HistoricalObservationNamePropertyKey)
+	opts.HistoricalObservationServiceLinkPropertyKey = strings.TrimSpace(opts.HistoricalObservationServiceLinkPropertyKey)
+	opts.HistoricalObservationPortPropertyKey = strings.TrimSpace(opts.HistoricalObservationPortPropertyKey)
+	opts.HistoricalObservationObservedStatePropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedStatePropertyKey)
+	opts.HistoricalObservationObservedBannerPropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedBannerPropertyKey)
+	opts.HistoricalObservationObservedServicePropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedServicePropertyKey)
+	opts.HistoricalObservationTimestampPropertyKey = strings.TrimSpace(opts.HistoricalObservationTimestampPropertyKey)
 	return opts
 }
 
@@ -361,10 +417,12 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--url or ANYTYPE_URL is required\n")
 	case opts.Version == "":
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
-	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "":
+	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
+	case opts.HistoricalObservationNamePropertyKey == "" || opts.HistoricalObservationServiceLinkPropertyKey == "" || opts.HistoricalObservationPortPropertyKey == "" || opts.HistoricalObservationObservedStatePropertyKey == "" || opts.HistoricalObservationObservedBannerPropertyKey == "" || opts.HistoricalObservationObservedServicePropertyKey == "" || opts.HistoricalObservationTimestampPropertyKey == "":
+		return fmt.Errorf("Anytype service historical observation property keys must not be empty\n")
 	}
 	return nil
 }
@@ -376,6 +434,36 @@ func anytypeCommandRunProperties(opts AnytypeOptions, engagementID string, run s
 	return []anytypeProperty{
 		selectProperty(opts.ScanStatusPropertyKey, anytypeCommandRunStatus(run.Status)),
 		textProperty(opts.TimestampPropertyKey, commandRunStartedAt(run)),
+		objectsProperty(opts.EngagementPropertyKey, engagementID),
+	}
+}
+
+func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []string) []anytypeProperty {
+	return []anytypeProperty{
+		textProperty(opts.AliasPropertyKey, strings.Join(aliases, ", ")),
+		objectsProperty(opts.EngagementPropertyKey, engagementID),
+	}
+}
+
+func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, scan storage.PortScanRecord) []anytypeProperty {
+	return []anytypeProperty{
+		textProperty(opts.PortPropertyKey, anytypePortValue(scan.Port, scan.Protocol)),
+		textProperty(opts.StatePropertyKey, scan.State),
+		textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
+		textProperty(opts.BannerPropertyKey, scan.Version),
+		objectsProperty(opts.EngagementPropertyKey, engagementID),
+		objectsProperty(opts.AssetPropertyKey, assetID),
+	}
+}
+
+func anytypeHistoricalObservationProperties(opts AnytypeOptions, engagementID string, serviceID string, observation storage.ServiceHistoricalObservationRecord) []anytypeProperty {
+	return []anytypeProperty{
+		objectsProperty(opts.HistoricalObservationServiceLinkPropertyKey, serviceID),
+		textProperty(opts.HistoricalObservationPortPropertyKey, anytypePortValue(observation.Port, observation.Protocol)),
+		textProperty(opts.HistoricalObservationObservedStatePropertyKey, observation.ObservedState),
+		textProperty(opts.HistoricalObservationObservedBannerPropertyKey, observation.ObservedBanner),
+		textProperty(opts.HistoricalObservationObservedServicePropertyKey, observation.ObservedService),
+		textProperty(opts.HistoricalObservationTimestampPropertyKey, observation.ObservedAt.UTC().Format(time.RFC3339)),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
 	}
 }
@@ -427,6 +515,67 @@ func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.Po
 		assets = append(assets, anytypeAssetExport{IP: ip, Aliases: aliases})
 	}
 	return assets
+}
+
+func newAnytypeClient(opts AnytypeOptions) anytypeClient {
+	return anytypeClient{
+		baseURL: opts.BaseURL,
+		spaceID: opts.SpaceID,
+		token:   opts.Token,
+		version: opts.Version,
+		client:  http.DefaultClient,
+	}
+}
+
+func anytypeServiceObservationKey(ip string, port int, protocol string) string {
+	return strings.TrimSpace(ip) + "|" + strconv.Itoa(port) + "|" + strings.ToLower(strings.TrimSpace(protocol))
+}
+
+func anytypePortValue(port int, protocol string) string {
+	return fmt.Sprintf("%d/%s", port, strings.ToLower(strings.TrimSpace(protocol)))
+}
+
+func anytypeHistoricalObservationName(observation storage.ServiceHistoricalObservationRecord, serviceName string) string {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		// Fall back to the observation itself when no current service name was resolved.
+		serviceName = anytypeServiceObservationFallbackName(observation)
+	}
+	return serviceName + " @ " + observation.ObservedAt.UTC().Format(time.RFC3339)
+}
+
+func collidesWithCurrentService(observation storage.ServiceHistoricalObservationRecord, scans []storage.PortScanRecord) bool {
+	for _, scan := range scans {
+		if strings.TrimSpace(scan.IP) != strings.TrimSpace(observation.HostIP) {
+			continue
+		}
+		if scan.Port != observation.Port {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(scan.Protocol), strings.TrimSpace(observation.Protocol)) {
+			continue
+		}
+		// Create historical objects only when the observation disagrees with the current service snapshot.
+		if !strings.EqualFold(strings.TrimSpace(scan.State), strings.TrimSpace(observation.ObservedState)) {
+			return true
+		}
+		if !strings.EqualFold(strings.TrimSpace(scan.Service), strings.TrimSpace(observation.ObservedService)) {
+			return true
+		}
+		if strings.TrimSpace(scan.Version) != strings.TrimSpace(observation.ObservedBanner) {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+func anytypeServiceObservationFallbackName(observation storage.ServiceHistoricalObservationRecord) string {
+	target := strings.TrimSpace(observation.Hostname)
+	if target == "" {
+		target = strings.TrimSpace(observation.HostIP)
+	}
+	return fmt.Sprintf("%d %s - %s", observation.Port, formatAnytypeService(observation.ObservedService, observation.Port), target)
 }
 
 func anytypeServiceObjectName(scan storage.PortScanRecord, aliases []string) string {
@@ -595,6 +744,28 @@ func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, com
 		}
 	}
 	return nil, nil
+}
+
+func (c anytypeClient) historicalObservationExists(ctx context.Context, typeKey string, name string, observedAt time.Time, timestampPropertyKey string) (bool, error) {
+	body := map[string]any{
+		"query": name,
+		"types": []string{typeKey},
+	}
+	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
+	if err != nil {
+		return false, err
+	}
+	wantName := strings.TrimSpace(name)
+	wantTimestamp := observedAt.UTC().Format(time.RFC3339)
+	for _, candidate := range anytypeResponseObjects(raw) {
+		if anytypeString(candidate["name"]) != wantName {
+			continue
+		}
+		if anytypePropertyString(candidate, timestampPropertyKey) == wantTimestamp {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // updateScanBody patches the object markdown for an existing Scan so rerunning

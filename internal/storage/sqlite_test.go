@@ -153,6 +153,46 @@ func TestDomainExistsAndSubdomainsByDomainMissing(t *testing.T) {
 	}
 }
 
+func TestServiceHistoricalObservationSchemaMigrationAndQuery(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recon.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	wantObservedAt := time.Date(2026, 5, 24, 19, 12, 44, 0, time.UTC)
+	err = store.SaveServiceHistoricalObservations("demo.example", []ServiceHistoricalObservationRecord{{
+		Domain:          "demo.example",
+		HostIP:          "10.20.30.40",
+		Hostname:        "api.demo.example",
+		Port:            443,
+		Protocol:        "tcp",
+		ObservedState:   "open",
+		ObservedBanner:  "envoy 1.31.2",
+		ObservedService: "https",
+		ObservedAt:      wantObservedAt,
+		Source:          "operator-b",
+	}})
+	if err != nil {
+		t.Fatalf("save service historical observations: %v", err)
+	}
+
+	records, err := store.ServiceHistoricalObservationsByDomain("demo.example")
+	if err != nil {
+		t.Fatalf("service historical observations by domain: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("len(records)=%d; want 1", len(records))
+	}
+	if records[0].Hostname != "api.demo.example" {
+		t.Fatalf("hostname=%q; want api.demo.example", records[0].Hostname)
+	}
+	if !records[0].ObservedAt.Equal(wantObservedAt) {
+		t.Fatalf("observed_at=%s; want %s", records[0].ObservedAt, wantObservedAt)
+	}
+}
+
 func TestDomainResolutionHelpersAndVHostSave(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "recon.db")
 	store, err := Open(dbPath)
