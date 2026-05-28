@@ -20,14 +20,14 @@ import (
 // AnytypeOptions contains connection settings plus Anytype type/property keys
 // needed to map logy's stored recon data into the user's Anytype workspace.
 type AnytypeOptions struct {
-	Domain           string
-	EngagementName   string
-	DatabasePath     string
-	SpaceID          string
-	BaseURL          string
-	Token            string
-	Version          string
-	DebugScanPayload bool
+	Domain         string
+	EngagementName string
+	DatabasePath   string
+	SpaceID        string
+	BaseURL        string
+	Token          string
+	Version        string
+	OnlyScans      bool
 
 	EngagementTypeKey                   string
 	AssetTypeKey                        string
@@ -131,7 +131,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	}
 
 	assets := buildAnytypeAssets(subdomains, scans)
-	if len(assets) == 0 {
+	if !opts.OnlyScans && len(assets) == 0 {
 		return AnytypeResult{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
 
@@ -145,32 +145,34 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	createdAssets := 0
 	reusedAssets := 0
 	updatedAssets := 0
-	for i := range assets {
-		existing, err := client.findObjectByExactName(ctx, opts.AssetTypeKey, assets[i].IP)
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("search Anytype asset %s: %w", assets[i].IP, err)
-		}
-		if existing != nil {
-			assets[i].ID = existing.ID
-			reusedAssets++
-			if updated, err := client.mergeAssetAliases(ctx, existing, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
-				return AnytypeResult{}, fmt.Errorf("update Anytype asset %s aliases: %w", assets[i].IP, err)
-			} else if updated {
-				updatedAssets++
+	if !opts.OnlyScans {
+		for i := range assets {
+			existing, err := client.findObjectByExactName(ctx, opts.AssetTypeKey, assets[i].IP)
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("search Anytype asset %s: %w", assets[i].IP, err)
 			}
-			continue
-		}
+			if existing != nil {
+				assets[i].ID = existing.ID
+				reusedAssets++
+				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+					return AnytypeResult{}, fmt.Errorf("update Anytype asset %s aliases: %w", assets[i].IP, err)
+				} else if updated {
+					updatedAssets++
+				}
+				continue
+			}
 
-		assetID, err := client.createObject(ctx, anytypeCreateObjectRequest{
-			TypeKey:    opts.AssetTypeKey,
-			Name:       assets[i].IP,
-			Properties: anytypeAssetProperties(opts, engagementID, assets[i].Aliases),
-		})
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
+			assetID, err := client.createObject(ctx, anytypeCreateObjectRequest{
+				TypeKey:    opts.AssetTypeKey,
+				Name:       assets[i].IP,
+				Properties: anytypeAssetProperties(opts, engagementID, assets[i].Aliases),
+			})
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
+			}
+			assets[i].ID = assetID
+			createdAssets++
 		}
-		assets[i].ID = assetID
-		createdAssets++
 	}
 
 	assetIDByIP := make(map[string]string, len(assets))
@@ -185,74 +187,78 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	// Reuse the same service identity later when we attach historical evidence.
 	serviceIDByKey := make(map[string]string, len(scans))
 	serviceNameByKey := make(map[string]string, len(scans))
-	for _, scan := range scans {
-		assetID := assetIDByIP[scan.IP]
-		if assetID == "" {
-			continue
-		}
-		serviceKey := anytypeServiceObservationKey(scan.IP, scan.Port, scan.Protocol)
-		serviceName := anytypeServiceObjectName(scan, aliasesByIP[scan.IP])
-		exists, err := client.serviceExists(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("search Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
-		}
-		if exists {
-			reusedServices++
-			existing, err := client.findObjectByExactName(ctx, opts.ServiceTypeKey, serviceName)
-			if err == nil && existing != nil {
-				serviceIDByKey[serviceKey] = existing.ID
+	if !opts.OnlyScans {
+		for _, scan := range scans {
+			assetID := assetIDByIP[scan.IP]
+			if assetID == "" {
+				continue
+			}
+			serviceKey := anytypeServiceObservationKey(scan.IP, scan.Port, scan.Protocol)
+			serviceName := anytypeServiceObjectName(scan, aliasesByIP[scan.IP])
+			exists, err := client.serviceExists(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("search Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
+			}
+			if exists {
+				reusedServices++
+				existing, err := client.findObjectByExactName(ctx, opts.ServiceTypeKey, serviceName)
+				if err == nil && existing != nil {
+					serviceIDByKey[serviceKey] = existing.ID
+					serviceNameByKey[serviceKey] = serviceName
+				}
+				continue
+			}
+			serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
+				TypeKey:    opts.ServiceTypeKey,
+				Name:       serviceName,
+				Properties: anytypeServiceProperties(opts, engagementID, assetID, scan),
+			})
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("create Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
+			}
+			if serviceID != "" {
+				createdServices++
+				serviceIDByKey[serviceKey] = serviceID
 				serviceNameByKey[serviceKey] = serviceName
 			}
-			continue
-		}
-		serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
-			TypeKey:    opts.ServiceTypeKey,
-			Name:       serviceName,
-			Properties: anytypeServiceProperties(opts, engagementID, assetID, scan),
-		})
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("create Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
-		}
-		if serviceID != "" {
-			createdServices++
-			serviceIDByKey[serviceKey] = serviceID
-			serviceNameByKey[serviceKey] = serviceName
 		}
 	}
 
 	createdHistorical := 0
 	skippedHistorical := 0
-	for _, observation := range observations {
-		// Historical observations only make sense when they point at a stable
-		// service object from the same export run.
-		serviceKey := anytypeServiceObservationKey(observation.HostIP, observation.Port, observation.Protocol)
-		serviceID := serviceIDByKey[serviceKey]
-		serviceName := serviceNameByKey[serviceKey]
-		if serviceID == "" || serviceName == "" {
-			continue
-		}
-		if !collidesWithCurrentService(observation, scans) {
-			continue
-		}
-		name := anytypeHistoricalObservationName(observation, serviceName)
-		exists, err := client.historicalObservationExists(ctx, opts.ServiceHistoricalObservationTypeKey, name, observation.ObservedAt, opts.HistoricalObservationTimestampPropertyKey)
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("search Anytype service historical observation for %s: %w", name, err)
-		}
-		if exists {
-			skippedHistorical++
-			continue
-		}
-		observationID, err := client.createObject(ctx, anytypeCreateObjectRequest{
-			TypeKey:    opts.ServiceHistoricalObservationTypeKey,
-			Name:       name,
-			Properties: anytypeHistoricalObservationProperties(opts, engagementID, serviceID, observation),
-		})
-		if err != nil {
-			return AnytypeResult{}, fmt.Errorf("create Anytype service historical observation for %s: %w", name, err)
-		}
-		if observationID != "" {
-			createdHistorical++
+	if !opts.OnlyScans {
+		for _, observation := range observations {
+			// Historical observations only make sense when they point at a stable
+			// service object from the same export run.
+			serviceKey := anytypeServiceObservationKey(observation.HostIP, observation.Port, observation.Protocol)
+			serviceID := serviceIDByKey[serviceKey]
+			serviceName := serviceNameByKey[serviceKey]
+			if serviceID == "" || serviceName == "" {
+				continue
+			}
+			if !collidesWithCurrentService(observation, scans) {
+				continue
+			}
+			name := anytypeHistoricalObservationName(observation, serviceName)
+			exists, err := client.historicalObservationExists(ctx, opts.ServiceHistoricalObservationTypeKey, name, observation.ObservedAt, opts.HistoricalObservationTimestampPropertyKey)
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("search Anytype service historical observation for %s: %w", name, err)
+			}
+			if exists {
+				skippedHistorical++
+				continue
+			}
+			observationID, err := client.createObject(ctx, anytypeCreateObjectRequest{
+				TypeKey:    opts.ServiceHistoricalObservationTypeKey,
+				Name:       name,
+				Properties: anytypeHistoricalObservationProperties(opts, engagementID, serviceID, observation),
+			})
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("create Anytype service historical observation for %s: %w", name, err)
+			}
+			if observationID != "" {
+				createdHistorical++
+			}
 		}
 	}
 
@@ -264,9 +270,6 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			return AnytypeResult{}, fmt.Errorf("search Anytype scan for command run %d: %w", run.ID, err)
 		}
 		if existing != nil {
-			if opts.DebugScanPayload {
-				logAnytypeScanPayload(http.MethodPatch, "/v1/spaces/"+opts.SpaceID+"/objects/"+existing.ID, anytypeUpdateObjectRequest{Markdown: mustCommandRunMarkdown(run, opts.DatabasePath)})
-			}
 			updated, err := client.updateScanBody(ctx, existing.ID, run, opts.DatabasePath)
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("update Anytype scan body for command run %d: %w", run.ID, err)
@@ -287,9 +290,6 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			Name:       run.Command,
 			Markdown:   markdown,
 			Properties: anytypeCommandRunProperties(opts, engagementID, run),
-		}
-		if opts.DebugScanPayload {
-			logAnytypeScanPayload(http.MethodPost, "/v1/spaces/"+opts.SpaceID+"/objects", payload)
 		}
 		scanID, err := client.createObject(ctx, payload)
 		if err != nil {
@@ -326,7 +326,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 	}
 
 	assets := buildAnytypeAssets(subdomains, scans)
-	if len(assets) == 0 {
+	if !opts.OnlyScans && len(assets) == 0 {
 		return AnytypePreview{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
 
@@ -336,21 +336,23 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 		return AnytypePreview{}, err
 	}
 
-	assetIPs := make(map[string]struct{}, len(assets))
-	for _, asset := range assets {
-		assetIPs[asset.IP] = struct{}{}
-	}
 	serviceCount := 0
-	for _, scan := range scans {
-		if _, ok := assetIPs[scan.IP]; ok {
-			serviceCount++
-		}
-	}
 	historicalCount := 0
-	for _, observation := range observations {
-		// Preview only counts observations that would produce a new historical object.
-		if collidesWithCurrentService(observation, scans) {
-			historicalCount++
+	if !opts.OnlyScans {
+		assetIPs := make(map[string]struct{}, len(assets))
+		for _, asset := range assets {
+			assetIPs[asset.IP] = struct{}{}
+		}
+		for _, scan := range scans {
+			if _, ok := assetIPs[scan.IP]; ok {
+				serviceCount++
+			}
+		}
+		for _, observation := range observations {
+			// Preview only counts observations that would produce a new historical object.
+			if collidesWithCurrentService(observation, scans) {
+				historicalCount++
+			}
 		}
 	}
 
@@ -1143,27 +1145,4 @@ func resolveTranscriptPath(run storage.CommandRunRecord, databasePath string) st
 		return path
 	}
 	return filepath.Join(baseDir, path)
-}
-
-// mustCommandRunMarkdown is used only for debug logging. Export still performs
-// the real error handling on the main path; this helper just keeps the debug
-// payload printable even when transcript rendering fails.
-func mustCommandRunMarkdown(run storage.CommandRunRecord, databasePath string) string {
-	markdown, err := commandRunMarkdown(run, databasePath)
-	if err != nil {
-		return "logy debug: failed to render transcript markdown: " + err.Error()
-	}
-	return markdown
-}
-
-// logAnytypeScanPayload prints the final request body for Scan object
-// create/update operations so export debugging can confirm the exact markdown
-// body Anytype receives.
-func logAnytypeScanPayload(method string, path string, payload any) {
-	raw, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "logy anytype debug %s %s payload marshal error: %v\n", method, path, err)
-		return
-	}
-	fmt.Fprintf(os.Stderr, "logy anytype debug %s %s\n%s\n", method, path, string(raw))
 }

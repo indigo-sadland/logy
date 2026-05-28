@@ -48,8 +48,8 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.BaseURL, "url", envOrDefault("ANYTYPE_URL", "http://127.0.0.1:31009"), "Anytype Local API base URL")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.Token, "token", envOrDefault("ANYTYPE_TOKEN", ""), "Anytype API token")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.Version, "anytype-version", envOrDefault("ANYTYPE_VERSION", defaultAnytypeVersion), "Anytype API version header")
-	exportAnytypeCmd.Flags().BoolVar(&anytypeExport.DebugScanPayload, "debug-scan-payload", false, "print final Anytype Scan create/update JSON payloads to stderr")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ConfigPath, "config", defaultConfigPath(), "path to logy's config yaml")
+	exportAnytypeCmd.Flags().BoolVar(&anytypeExport.OnlyScans, "only-scans", false, "export only Scan objects")
 	exportAnytypeCmd.Flags().BoolVar(&anytypeExport.Yes, "yes", false, "skip interactive export confirmation")
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementTypeKey, "engagement-type", "engagement", "Anytype type key for Engagement objects")
@@ -142,12 +142,15 @@ func runExportAnytype(cmd *cobra.Command) error {
 	}
 	defer store.Close()
 
-	subdomains, err := store.SubdomainsByDomain(opts.Domain)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("no subdomain results for domain %s\n", opts.Domain)
+	var subdomains []storage.SubdomainRecord
+	if !opts.OnlyScans {
+		subdomains, err = store.SubdomainsByDomain(opts.Domain)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("no subdomain results for domain %s\n", opts.Domain)
+			}
+			return err
 		}
-		return err
 	}
 
 	scans, err := store.PortScansByDomain(opts.Domain)
@@ -162,18 +165,24 @@ func runExportAnytype(cmd *cobra.Command) error {
 	runs, err := store.CommandRunsByDomain(opts.Domain)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			if opts.OnlyScans {
+				return fmt.Errorf("no command run results for domain %s\n", opts.Domain)
+			}
 			runs = nil
 		} else {
 			return err
 		}
 	}
 	// Historical observations are optional; older domains may not have any yet.
-	observations, err := store.ServiceHistoricalObservationsByDomain(opts.Domain)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			observations = nil
-		} else {
-			return err
+	var observations []storage.ServiceHistoricalObservationRecord
+	if !opts.OnlyScans {
+		observations, err = store.ServiceHistoricalObservationsByDomain(opts.Domain)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				observations = nil
+			} else {
+				return err
+			}
 		}
 	}
 	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, runs)
