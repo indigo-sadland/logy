@@ -56,6 +56,7 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetTypeKey, "asset-type", "asset", "Anytype type key for Asset objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceTypeKey, "service-type", "service", "Anytype type key for Service objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ScanTypeKey, "scan-type", "scan", "Anytype type key for Scan objects")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.WebAppObservationTypeKey, "web-app-observation-type", "web_app_observation", "Anytype type key for Web app observation objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceHistoricalObservationTypeKey, "service-historical-observation-type", "historical_observation", "Anytype type key for Service historical observation objects")
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "Anytype property key for Asset aliases")
@@ -67,6 +68,9 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.BannerPropertyKey, "banner-property", "banner", "Anytype property key for Service banner/version")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ScanStatusPropertyKey, "scan-status-property", "scan_status", "Anytype select property key for Scan status")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.TimestampPropertyKey, "timestamp-property", "timestamp", "Anytype text property key for Scan start timestamp")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.WebAppObservationTitlePropertyKey, "web-app-observation-title-property", "title", "Anytype property key for web app observation title")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.WebAppObservationStatusCodePropertyKey, "web-app-observation-status-code-property", "status_code", "Anytype property key for web app observation status code")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.WebAppObservationTechnologiesPropertyKey, "web-app-observation-technologies-property", "technologies", "Anytype property key for web app observation technologies")
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationServiceLinkPropertyKey, "service-historical-observation-service-link-property", "service_link", "Anytype property key for historical observation service link")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationPortPropertyKey, "service-historical-observation-port-property", "port", "Anytype property key for historical observation port")
@@ -84,6 +88,7 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"asset-type",
 		"service-type",
 		"scan-type",
+		"web-app-observation-type",
 		"service-historical-observation-type",
 		"alias-property",
 		"engagement-property",
@@ -94,7 +99,9 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"banner-property",
 		"scan-status-property",
 		"timestamp-property",
-		"service-historical-observation-name-property",
+		"web-app-observation-title-property",
+		"web-app-observation-status-code-property",
+		"web-app-observation-technologies-property",
 		"service-historical-observation-service-link-property",
 		"service-historical-observation-port-property",
 		"service-historical-observation-state-property",
@@ -185,7 +192,19 @@ func runExportAnytype(cmd *cobra.Command) error {
 			}
 		}
 	}
-	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, runs)
+	// Web probe history exports independently from the service graph.
+	var webProbes []storage.WebProbeRecord
+	if !opts.OnlyScans {
+		webProbes, err = store.WebProbesByDomain(opts.Domain)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				webProbes = nil
+			} else {
+				return err
+			}
+		}
+	}
+	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
 	if err != nil {
 		return err
 	}
@@ -195,7 +214,7 @@ func runExportAnytype(cmd *cobra.Command) error {
 		}
 	}
 
-	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, runs)
+	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
 	if err != nil {
 		return err
 	}
@@ -210,6 +229,8 @@ func runExportAnytype(cmd *cobra.Command) error {
 		AssetsUpdated                        int    `json:"assets_updated"`
 		ServicesCreated                      int    `json:"services_created"`
 		ServicesReused                       int    `json:"services_reused"`
+		WebAppObservationsCreated            int    `json:"web_app_observations_created"`
+		WebAppObservationsSkipped            int    `json:"web_app_observations_skipped"`
 		ServiceHistoricalObservationsCreated int    `json:"service_historical_observations_created"`
 		ServiceHistoricalObservationsSkipped int    `json:"service_historical_observations_skipped"`
 		ScansCreated                         int    `json:"scans_created"`
@@ -226,6 +247,8 @@ func runExportAnytype(cmd *cobra.Command) error {
 		AssetsUpdated:                        result.AssetsUpdated,
 		ServicesCreated:                      result.ServicesCreated,
 		ServicesReused:                       result.ServicesReused,
+		WebAppObservationsCreated:            result.WebAppObservationsCreated,
+		WebAppObservationsSkipped:            result.WebAppObservationsSkipped,
 		ServiceHistoricalObservationsCreated: result.ServiceHistoricalObservationsCreated,
 		ServiceHistoricalObservationsSkipped: result.ServiceHistoricalObservationsSkipped,
 		ScansCreated:                         result.ScansCreated,
@@ -254,6 +277,7 @@ func confirmAnytypeExport(preview exporter.AnytypePreview) error {
 	fmt.Fprintf(os.Stderr, "  url:           %s\n", preview.AnytypeURL)
 	fmt.Fprintf(os.Stderr, "  assets:        %d\n", preview.Assets)
 	fmt.Fprintf(os.Stderr, "  services:      %d\n", preview.Services)
+	fmt.Fprintf(os.Stderr, "  web apps:      %d\n", preview.WebAppObservations)
 	fmt.Fprintf(os.Stderr, "  history:       %d\n", preview.ServiceHistoricalObservations)
 	fmt.Fprintf(os.Stderr, "  scans:         %d\n", preview.Scans)
 	answer, err := promptLine("Proceed with export? [y/N]: ")

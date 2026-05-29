@@ -15,14 +15,11 @@
   - `resolve.go` - `domain resolve vhost` and `domain resolve permute` enrichment commands
   - `portscan.go` - top-level `portscan` commands for raw `nmap`, DB-backed scans, exact saved-target selection, interactive saved-target picking, persistence, and result display
   - `portscan_picker.go` - terminal picker helpers for interactive DB-backed single-target scans across hostname-backed and IP-only assets
-  - `web.go` - top-level `web` command group
-  - `probe.go` - `web probe` workflows for raw `httpx`, saved raw probes, and DB-backed automatic probing
+  - `probe.go` - top-level `probe` commands for raw `httpx`, saved raw probes, DB-backed automatic probing, and stored result display
   - `run.go` - `holdmy exec` and `holdmy show` command tracking workflows for external tools
   - `serve.go` - `serve` command for the read-only local web UI
-  - `export.go` - `export anytype` push workflow for saved Assets and Services
+  - `export.go` - `export anytype` push workflow for saved Assets, Services, service historical observations, web app observations, and Scans, plus scan-only export mode
   - `secrets.go` - `secrets` command group for age-encrypted local credentials
-  - `crawl.go` - placeholder for future crawl commands
-  - `fuzz.go` - placeholder for future fuzz commands
 
 ## Internal Packages
 
@@ -38,11 +35,12 @@
   - `view_models.go` - host-centric web view aggregation helpers for ports, probes, and candidate links
 - `internal/storage/` - SQLite persistence layer
   - `store.go` - store construction and database handle lifecycle
-  - `schema.go` - SQLite schema initialization, including confirmed subdomain state and permutation candidate storage
+  - `schema.go` - SQLite schema initialization, including confirmed subdomain state, service historical observations, and permutation candidate storage
   - `types.go` - storage record types shared by command and module code
   - `subdomains.go` - confirmed subdomain discovery and resolution persistence/query helpers, including saved scan target aggregation
   - `candidates.go` - unresolved permutation candidate persistence, listing, and promotion cleanup helpers
   - `portscans.go` - open-port scan persistence/query helpers, including IP-only saved target support for the picker
+  - `service_observations.go` - append-only service historical observation persistence/query helpers for export and comparison workflows
   - `webprobes.go` - web probe history and automatic probe target construction
   - `commandruns.go` - external command execution history persistence/query helpers
   - `dashboard.go` - domain summary and dashboard query helpers
@@ -64,7 +62,7 @@
   - `provider/` - provider interfaces and CLI-backed provider adapter
   - `models/` - discovery config model aliases used by provider factories
 - `internal/modules/exporter/`
-  - `anytype.go` - Anytype API client and push workflow for Assets and Services
+  - `anytype.go` - Anytype API client and push workflow for Assets, Services, service historical observations, web app observations, and Scans
 - `internal/modules/resolver/` - DNS and vhost resolution adapters
   - `resolver.go` - `dnsx` wrapper, live progress handling, and JSONL response parsing
   - `progress.go` - terminal progress tracker for long-running `dnsx` resolution
@@ -73,6 +71,8 @@
   - `gotator.go` - `gotator` wrapper for generating candidate subdomain permutations that are later confirmed through DNS or vhost resolution
 - `internal/modules/portscan/`
   - `nmap.go` - `nmap` wrapper, XML capture, XML parsing, and open-port normalization
+- `internal/modules/tracking/`
+  - `service.go` - command execution tracking, transcript capture, and stored command run rendering for `holdmy`
 - `internal/modules/webprobe/`
   - `httpx.go` - `httpx` wrapper, raw passthrough mode, JSONL parsing, and result normalization
 

@@ -33,6 +33,7 @@ type AnytypeOptions struct {
 	AssetTypeKey                        string
 	ServiceTypeKey                      string
 	ScanTypeKey                         string
+	WebAppObservationTypeKey            string
 	ServiceHistoricalObservationTypeKey string
 
 	AliasPropertyKey                                string
@@ -44,7 +45,9 @@ type AnytypeOptions struct {
 	BannerPropertyKey                               string
 	ScanStatusPropertyKey                           string
 	TimestampPropertyKey                            string
-	HistoricalObservationNamePropertyKey            string
+	WebAppObservationTitlePropertyKey               string
+	WebAppObservationStatusCodePropertyKey          string
+	WebAppObservationTechnologiesPropertyKey        string
 	HistoricalObservationServiceLinkPropertyKey     string
 	HistoricalObservationPortPropertyKey            string
 	HistoricalObservationObservedStatePropertyKey   string
@@ -63,6 +66,8 @@ type AnytypeResult struct {
 	AssetsUpdated                        int
 	ServicesCreated                      int
 	ServicesReused                       int
+	WebAppObservationsCreated            int
+	WebAppObservationsSkipped            int
 	ServiceHistoricalObservationsCreated int
 	ServiceHistoricalObservationsSkipped int
 	ScansCreated                         int
@@ -78,6 +83,7 @@ type AnytypePreview struct {
 	EngagementID                  string
 	Assets                        int
 	Services                      int
+	WebAppObservations            int
 	ServiceHistoricalObservations int
 	Scans                         int
 	AnytypeSpace                  string
@@ -122,15 +128,16 @@ type anytypeObject struct {
 	Raw map[string]any
 }
 
-// ExportAnytype pushes saved subdomain and port scan state into Anytype.
-// It creates one Asset per IP address and one Service per saved port scan.
-func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
+// ExportAnytype pushes saved subdomain, service, web probe, and command run
+// state into Anytype.
+func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypeResult{}, err
 	}
 
 	assets := buildAnytypeAssets(subdomains, scans)
+	// Scan-only mode skips the asset/service graph entirely.
 	if !opts.OnlyScans && len(assets) == 0 {
 		return AnytypeResult{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
@@ -262,6 +269,37 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		}
 	}
 
+	createdWebApps := 0
+	skippedWebApps := 0
+	if !opts.OnlyScans {
+		for _, probe := range webProbes {
+			// The saved probe URL is the Anytype object name and duplicate key.
+			name := strings.TrimSpace(probe.URL)
+			if name == "" {
+				continue
+			}
+			exists, err := client.webAppObservationExists(ctx, opts.WebAppObservationTypeKey, name)
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("search Anytype web app observation for %s: %w", name, err)
+			}
+			if exists {
+				skippedWebApps++
+				continue
+			}
+			objectID, err := client.createObject(ctx, anytypeCreateObjectRequest{
+				TypeKey:    opts.WebAppObservationTypeKey,
+				Name:       name,
+				Properties: anytypeWebAppObservationProperties(opts, engagementID, probe),
+			})
+			if err != nil {
+				return AnytypeResult{}, fmt.Errorf("create Anytype web app observation for %s: %w", name, err)
+			}
+			if objectID != "" {
+				createdWebApps++
+			}
+		}
+	}
+
 	createdScans := 0
 	skippedScans := 0
 	for _, run := range runs {
@@ -309,6 +347,8 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		AssetsUpdated:                        updatedAssets,
 		ServicesCreated:                      createdServices,
 		ServicesReused:                       reusedServices,
+		WebAppObservationsCreated:            createdWebApps,
+		WebAppObservationsSkipped:            skippedWebApps,
 		ServiceHistoricalObservationsCreated: createdHistorical,
 		ServiceHistoricalObservationsSkipped: skippedHistorical,
 		ScansCreated:                         createdScans,
@@ -319,7 +359,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 }
 
 // PreviewAnytype resolves the target engagement and counts the objects that would be created without mutating Anytype.
-func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
+func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypePreview{}, err
@@ -337,6 +377,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 	}
 
 	serviceCount := 0
+	webAppCount := 0
 	historicalCount := 0
 	if !opts.OnlyScans {
 		assetIPs := make(map[string]struct{}, len(assets))
@@ -354,6 +395,8 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 				historicalCount++
 			}
 		}
+		// Web probes are exported row-for-row, so preview can count them directly.
+		webAppCount = len(webProbes)
 	}
 
 	return AnytypePreview{
@@ -362,6 +405,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 		EngagementID:                  engagementID,
 		Assets:                        len(assets),
 		Services:                      serviceCount,
+		WebAppObservations:            webAppCount,
 		ServiceHistoricalObservations: historicalCount,
 		Scans:                         len(runs),
 		AnytypeSpace:                  opts.SpaceID,
@@ -383,6 +427,7 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.AssetTypeKey = strings.TrimSpace(opts.AssetTypeKey)
 	opts.ServiceTypeKey = strings.TrimSpace(opts.ServiceTypeKey)
 	opts.ScanTypeKey = strings.TrimSpace(opts.ScanTypeKey)
+	opts.WebAppObservationTypeKey = strings.TrimSpace(opts.WebAppObservationTypeKey)
 	opts.ServiceHistoricalObservationTypeKey = strings.TrimSpace(opts.ServiceHistoricalObservationTypeKey)
 	opts.AliasPropertyKey = strings.TrimSpace(opts.AliasPropertyKey)
 	opts.EngagementPropertyKey = strings.TrimSpace(opts.EngagementPropertyKey)
@@ -393,7 +438,9 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.BannerPropertyKey = strings.TrimSpace(opts.BannerPropertyKey)
 	opts.ScanStatusPropertyKey = strings.TrimSpace(opts.ScanStatusPropertyKey)
 	opts.TimestampPropertyKey = strings.TrimSpace(opts.TimestampPropertyKey)
-	opts.HistoricalObservationNamePropertyKey = strings.TrimSpace(opts.HistoricalObservationNamePropertyKey)
+	opts.WebAppObservationTitlePropertyKey = strings.TrimSpace(opts.WebAppObservationTitlePropertyKey)
+	opts.WebAppObservationStatusCodePropertyKey = strings.TrimSpace(opts.WebAppObservationStatusCodePropertyKey)
+	opts.WebAppObservationTechnologiesPropertyKey = strings.TrimSpace(opts.WebAppObservationTechnologiesPropertyKey)
 	opts.HistoricalObservationServiceLinkPropertyKey = strings.TrimSpace(opts.HistoricalObservationServiceLinkPropertyKey)
 	opts.HistoricalObservationPortPropertyKey = strings.TrimSpace(opts.HistoricalObservationPortPropertyKey)
 	opts.HistoricalObservationObservedStatePropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedStatePropertyKey)
@@ -419,11 +466,13 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--url or ANYTYPE_URL is required\n")
 	case opts.Version == "":
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
-	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
+	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.WebAppObservationTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
-	case opts.HistoricalObservationNamePropertyKey == "" || opts.HistoricalObservationServiceLinkPropertyKey == "" || opts.HistoricalObservationPortPropertyKey == "" || opts.HistoricalObservationObservedStatePropertyKey == "" || opts.HistoricalObservationObservedBannerPropertyKey == "" || opts.HistoricalObservationObservedServicePropertyKey == "" || opts.HistoricalObservationTimestampPropertyKey == "":
+	case opts.WebAppObservationTitlePropertyKey == "" || opts.WebAppObservationStatusCodePropertyKey == "" || opts.WebAppObservationTechnologiesPropertyKey == "":
+		return fmt.Errorf("Anytype web app observation property keys must not be empty\n")
+	case opts.HistoricalObservationServiceLinkPropertyKey == "" || opts.HistoricalObservationPortPropertyKey == "" || opts.HistoricalObservationObservedStatePropertyKey == "" || opts.HistoricalObservationObservedBannerPropertyKey == "" || opts.HistoricalObservationObservedServicePropertyKey == "" || opts.HistoricalObservationTimestampPropertyKey == "":
 		return fmt.Errorf("Anytype service historical observation property keys must not be empty\n")
 	}
 	return nil
@@ -466,6 +515,16 @@ func anytypeHistoricalObservationProperties(opts AnytypeOptions, engagementID st
 		textProperty(opts.HistoricalObservationObservedBannerPropertyKey, observation.ObservedBanner),
 		textProperty(opts.HistoricalObservationObservedServicePropertyKey, observation.ObservedService),
 		textProperty(opts.HistoricalObservationTimestampPropertyKey, observation.ObservedAt.UTC().Format(time.RFC3339)),
+		objectsProperty(opts.EngagementPropertyKey, engagementID),
+	}
+}
+
+func anytypeWebAppObservationProperties(opts AnytypeOptions, engagementID string, probe storage.WebProbeRecord) []anytypeProperty {
+	return []anytypeProperty{
+		textProperty(opts.WebAppObservationTitlePropertyKey, probe.Title),
+		// Anytype expects text here, so status stays numeric until the export edge.
+		textProperty(opts.WebAppObservationStatusCodePropertyKey, strconv.Itoa(probe.StatusCode)),
+		textProperty(opts.WebAppObservationTechnologiesPropertyKey, strings.Join(probe.Technologies, ",")),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
 	}
 }
@@ -768,6 +827,14 @@ func (c anytypeClient) historicalObservationExists(ctx context.Context, typeKey 
 		}
 	}
 	return false, nil
+}
+
+func (c anytypeClient) webAppObservationExists(ctx context.Context, typeKey string, name string) (bool, error) {
+	existing, err := c.findObjectByExactName(ctx, typeKey, name)
+	if err != nil {
+		return false, err
+	}
+	return existing != nil, nil
 }
 
 // updateScanBody patches the object markdown for an existing Scan so rerunning

@@ -205,6 +205,32 @@ func TestCollidesWithCurrentServiceMatchesStateServiceOrBannerChanges(t *testing
 	}
 }
 
+func TestAnytypeWebAppObservationPropertiesStringifyStatusAndJoinTechnologies(t *testing.T) {
+	properties := anytypeWebAppObservationProperties(AnytypeOptions{
+		WebAppObservationTitlePropertyKey:        "title",
+		WebAppObservationStatusCodePropertyKey:   "status_code",
+		WebAppObservationTechnologiesPropertyKey: "technologies",
+		EngagementPropertyKey:                    "engagement",
+	}, "eng-1", storage.WebProbeRecord{
+		Title:        "Demo Login",
+		StatusCode:   200,
+		Technologies: []string{"nginx", "react"},
+	})
+
+	if len(properties) != 4 {
+		t.Fatalf("len(properties)=%d; want 4", len(properties))
+	}
+	if got := properties[0]["text"]; got != "Demo Login" {
+		t.Fatalf("title=%v; want Demo Login", got)
+	}
+	if got := properties[1]["text"]; got != "200" {
+		t.Fatalf("status_code=%v; want 200", got)
+	}
+	if got := properties[2]["text"]; got != "nginx,react" {
+		t.Fatalf("technologies=%v; want nginx,react", got)
+	}
+}
+
 func TestObjectLinkedToEngagementVerifiesRelationWhenPresent(t *testing.T) {
 	object := map[string]any{
 		"properties": []any{
