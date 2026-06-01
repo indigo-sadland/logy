@@ -44,4 +44,5 @@ cd logy && go build -o logy main.go
 - Required for terminal output recording:
   - `script`
 
+> [!NOTE]
 > Also, if you want to experience export to **Anytype** you need to install it as well!
