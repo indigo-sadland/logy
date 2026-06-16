@@ -1,16 +1,16 @@
 package cmd
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/indigo-sadland/logy/internal/config"
 	"github.com/indigo-sadland/logy/internal/modules/webprobe"
 	"github.com/indigo-sadland/logy/internal/storage"
-	"os"
-	"strings"
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -19,6 +19,7 @@ import (
 var probeInputFile string
 var probeDomain string
 var probeSave bool
+var probeResolvers []string
 
 var probeCmd = &cobra.Command{
 	Use:     "probe",
@@ -59,6 +60,7 @@ func init() {
 	probeCmd.AddCommand(probeShowCmd)
 	probeCmd.Flags().StringVarP(&probeInputFile, "file", "f", "", "path to a file containing probe targets")
 	probeCmd.Flags().StringVarP(&probeDomain, "domain", "d", "", "root domain to probe from stored subdomains and port scan results")
+	probeCmd.Flags().StringSliceVarP(&probeResolvers, "resolver", "r", nil, "custom DNS resolvers to pass to httpx")
 	probeCmd.Flags().BoolVar(&probeSave, "save", false, "save raw-mode probe results in the database under --domain")
 	probeCmd.Flags().String("config", defaultConfigPath(), "path to logy's config yaml")
 	probeShowCmd.Flags().StringVarP(&probeDomain, "domain", "d", "", "root domain to show stored probe results for")
@@ -87,7 +89,7 @@ func runProbeRaw(cmd *cobra.Command, hasFile bool) error {
 	}
 
 	if !probeSave {
-		return webprobe.RunRaw(cmd.Context(), webprobe.Config{}, inputFile, os.Stdin, os.Stdout, os.Stderr)
+		return webprobe.RunRaw(cmd.Context(), webprobe.Config{Resolvers: probeResolvers}, inputFile, os.Stdin, os.Stdout, os.Stderr)
 	}
 
 	configPath, _ := cmd.Flags().GetString("config")
@@ -96,7 +98,7 @@ func runProbeRaw(cmd *cobra.Command, hasFile bool) error {
 		return err
 	}
 
-	results, err := webprobe.RunRawAndCapture(cmd.Context(), webprobe.Config{}, inputFile, os.Stdin, os.Stdout, os.Stderr)
+	results, err := webprobe.RunRawAndCapture(cmd.Context(), webprobe.Config{Resolvers: probeResolvers}, inputFile, os.Stdin, os.Stdout, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -148,7 +150,14 @@ func runProbeAutomatic(cmd *cobra.Command) error {
 		urls = append(urls, target.URL)
 	}
 
-	results, err := webprobe.ProbeTargets(context.Background(), webprobe.Config{}, urls)
+	// Automatic probing owns stdout JSON, so live status goes to stderr only.
+	progress := newProbeProgressPrinter(len(urls))
+	defer progress.finish()
+
+	results, err := webprobe.ProbeTargetsWithProgress(cmd.Context(), webprobe.Config{
+		Progress:  progress.report,
+		Resolvers: probeResolvers,
+	}, urls)
 	if err != nil {
 		return err
 	}
@@ -305,6 +314,75 @@ func runProbeShow(cmd *cobra.Command) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(output)
+}
+
+type probeProgressPrinter struct {
+	enabled bool
+	lastLen int
+	total   int
+}
+
+// Automatic probing prints progress on stderr so stdout can stay machine-readable.
+func newProbeProgressPrinter(total int) *probeProgressPrinter {
+	return &probeProgressPrinter{
+		enabled: isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd()),
+		total:   total,
+	}
+}
+
+func (p *probeProgressPrinter) report(progress webprobe.Progress) {
+	if !p.enabled {
+		return
+	}
+
+	total := progress.Total
+	if total <= 0 {
+		total = p.total
+	}
+	if total <= 0 {
+		total = 1
+	}
+
+	completed := progress.Completed
+	if completed > total {
+		completed = total
+	}
+
+	const width = 24
+	filled := completed * width / total
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+	line := fmt.Sprintf(
+		"\r[*] probe/httpx: [%s] %d/%d 2xx=%d 3xx=%d 4xx=%d 5xx=%d elapsed=%s",
+		bar,
+		completed,
+		total,
+		progress.Status2xx,
+		progress.Status3xx,
+		progress.Status4xx,
+		progress.Status5xx,
+		progress.Elapsed,
+	)
+	if progress.LastTarget != "" {
+		line += " last=" + progress.LastTarget
+	}
+	// Heartbeats mark long quiet stretches when httpx has not emitted a new JSON line yet.
+	if progress.Heartbeat {
+		line += " waiting"
+	}
+	if pad := p.lastLen - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	fmt.Fprint(os.Stderr, line)
+	p.lastLen = len(line)
+}
+
+// Finish the in-place progress line before the command prints anything else.
+func (p *probeProgressPrinter) finish() {
+	if !p.enabled || p.lastLen == 0 {
+		return
+	}
+	fmt.Fprint(os.Stderr, "\n")
+	p.lastLen = 0
 }
 
 func toWebProbeRecords(domain string, results []webprobe.Result) []storage.WebProbeRecord {

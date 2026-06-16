@@ -235,25 +235,25 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 				continue
 			}
 			serviceKey := anytypeServiceObservationKey(scan.IP, scan.Port, scan.Protocol)
-			serviceName := anytypeServiceObjectName(scan, aliasesByIP[scan.IP])
-			exists, err := client.serviceExists(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
+			serviceName := anytypeServiceObjectName(scan)
+			existing, err := client.findExistingService(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("search Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
 			}
-			if exists {
+			if existing != nil {
 				reusedServices++
-				existing, err := client.findObjectByExactName(ctx, opts.ServiceTypeKey, serviceName)
-				if err == nil && existing != nil {
-					serviceIDByKey[serviceKey] = existing.ID
-					serviceNameByKey[serviceKey] = serviceName
+				if _, err := client.mergeServiceAliases(ctx, existing, opts.AliasPropertyKey, aliasesByIP[scan.IP]); err != nil {
+					return AnytypeResult{}, fmt.Errorf("update Anytype service %s:%d/%s aliases: %w", scan.IP, scan.Port, scan.Protocol, err)
 				}
+				serviceIDByKey[serviceKey] = existing.ID
+				serviceNameByKey[serviceKey] = serviceName
 				progress.report("services")
 				continue
 			}
 			serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
 				TypeKey:    opts.ServiceTypeKey,
 				Name:       serviceName,
-				Properties: anytypeServiceProperties(opts, engagementID, assetID, scan),
+				Properties: anytypeServiceProperties(opts, engagementID, assetID, aliasesByIP[scan.IP], scan),
 			})
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("create Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
@@ -626,8 +626,9 @@ func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []
 	}
 }
 
-func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, scan storage.PortScanRecord) []anytypeProperty {
+func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, aliases []string, scan storage.PortScanRecord) []anytypeProperty {
 	return []anytypeProperty{
+		textProperty(opts.AliasPropertyKey, strings.Join(aliases, ", ")),
 		textProperty(opts.PortPropertyKey, anytypePortValue(scan.Port, scan.Protocol)),
 		textProperty(opts.StatePropertyKey, scan.State),
 		textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
@@ -758,7 +759,7 @@ func anytypeHistoricalObservationName(observation storage.ServiceHistoricalObser
 		// Fall back to the observation itself when no current service name was resolved.
 		serviceName = anytypeServiceObservationFallbackName(observation)
 	}
-	return serviceName + " @ " + observation.ObservedAt.UTC().Format(time.RFC3339)
+	return serviceName
 }
 
 func collidesWithCurrentService(observation storage.ServiceHistoricalObservationRecord, scans []storage.PortScanRecord) bool {
@@ -788,30 +789,21 @@ func collidesWithCurrentService(observation storage.ServiceHistoricalObservation
 }
 
 func anytypeServiceObservationFallbackName(observation storage.ServiceHistoricalObservationRecord) string {
-	target := strings.TrimSpace(observation.Hostname)
-	if target == "" {
-		target = strings.TrimSpace(observation.HostIP)
-	}
-	return fmt.Sprintf("%d %s - %s", observation.Port, formatAnytypeService(observation.ObservedService, observation.Port), target)
+	return fmt.Sprintf("%d %s - %s", observation.Port, formatAnytypeService(observation.ObservedService, observation.Port), strings.TrimSpace(observation.HostIP))
 }
 
-func anytypeServiceObjectName(scan storage.PortScanRecord, aliases []string) string {
-	// Prefer a hostname in the display name when one exists, while still linking
-	// the Service object to the IP Asset.
-	target := scan.IP
-	if len(aliases) > 0 {
-		target = aliases[0]
-	}
-	return fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), target)
+func anytypeServiceObjectName(scan storage.PortScanRecord) string {
+	// Service identity is the asset socket, not one hostname that happens to resolve to it.
+	return fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), strings.TrimSpace(scan.IP))
 }
 
-func anytypeServiceObjectNames(scan storage.PortScanRecord, aliases []string) []string {
-	// Search both the current alias-based name and the IP fallback name so
-	// services exported before hostname discovery are still reused.
-	return uniqueSortedStrings([]string{
-		anytypeServiceObjectName(scan, aliases),
-		anytypeServiceObjectName(scan, nil),
-	})
+func anytypeServiceReuseNames(scan storage.PortScanRecord, aliases []string) []string {
+	// Prefer the current IP-based name, then fall back to older alias-based names during reuse.
+	names := []string{anytypeServiceObjectName(scan)}
+	for _, alias := range aliases {
+		names = append(names, fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), strings.TrimSpace(alias)))
+	}
+	return uniqueStrings(names)
 }
 
 func formatAnytypeService(service string, port int) string {
@@ -921,20 +913,37 @@ func (c anytypeClient) mergeAssetAliases(ctx context.Context, object *anytypeObj
 	return true, nil
 }
 
-func (c anytypeClient) serviceExists(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (bool, error) {
-	for _, name := range anytypeServiceObjectNames(scan, aliases) {
+func (c anytypeClient) mergeServiceAliases(ctx context.Context, object *anytypeObject, aliasPropertyKey string, aliases []string) (bool, error) {
+	existingAliases := splitAliasText(anytypePropertyString(object.Raw, aliasPropertyKey))
+	mergedAliases := mergeAliasValues(existingAliases, aliases)
+	if slices.Equal(existingAliases, mergedAliases) {
+		return false, nil
+	}
+	_, err := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
+		Properties: []anytypeProperty{
+			textProperty(aliasPropertyKey, strings.Join(mergedAliases, ", ")),
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c anytypeClient) findExistingService(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (*anytypeObject, error) {
+	for _, name := range anytypeServiceReuseNames(scan, aliases) {
 		existing, err := c.findObjectByExactName(ctx, typeKey, name)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if existing == nil {
 			continue
 		}
 		if objectLinkedToEngagement(existing.Raw, engagementPropertyKey, engagementID) {
-			return true, nil
+			return existing, nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, command string, startedAt string, timestampPropertyKey string) (*anytypeObject, error) {
@@ -1411,6 +1420,24 @@ func uniqueSortedStrings(values []string) []string {
 		out = append(out, value)
 	}
 	slices.Sort(out)
+	return out
+}
+
+// Preserve candidate order so canonical names stay ahead of legacy fallbacks.
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
 	return out
 }
 

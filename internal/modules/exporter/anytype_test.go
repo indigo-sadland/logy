@@ -90,9 +90,17 @@ func TestMergeAliasValuesPreservesExistingAliases(t *testing.T) {
 	}
 }
 
-func TestAnytypeServiceObjectNamesIncludesAliasAndIPFallback(t *testing.T) {
-	got := anytypeServiceObjectNames(testPortScan("203.0.113.20", 443, "tcp", "https"), []string{"app.example.com"})
-	want := []string{"443 HTTPS - 203.0.113.20", "443 HTTPS - app.example.com"}
+func TestAnytypeServiceObjectNameUsesIPIdentity(t *testing.T) {
+	got := anytypeServiceObjectName(testPortScan("203.0.113.20", 443, "tcp", "https"))
+	want := "443 HTTPS - 203.0.113.20"
+	if got != want {
+		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestAnytypeServiceReuseNamesPreferIPAndKeepLegacyAliases(t *testing.T) {
+	got := anytypeServiceReuseNames(testPortScan("203.0.113.20", 443, "tcp", "https"), []string{"app.example.com", "admin.example.com"})
+	want := []string{"443 HTTPS - 203.0.113.20", "443 HTTPS - app.example.com", "443 HTTPS - admin.example.com"}
 	if len(got) != len(want) {
 		t.Fatalf("names=%v; want %v", got, want)
 	}
@@ -108,8 +116,8 @@ func TestAnytypeHistoricalObservationNameUsesServiceNameAndTimestamp(t *testing.
 		ObservedAt: time.Date(2026, 5, 24, 19, 12, 44, 0, time.UTC),
 	}
 
-	got := anytypeHistoricalObservationName(observation, "443 HTTPS - api.demo.example")
-	want := "443 HTTPS - api.demo.example @ 2026-05-24T19:12:44Z"
+	got := anytypeHistoricalObservationName(observation, "443 HTTPS - 10.20.30.40")
+	want := "443 HTTPS - 10.20.30.40"
 	if got != want {
 		t.Fatalf("name=%q; want %q", got, want)
 	}
@@ -125,9 +133,34 @@ func TestAnytypeHistoricalObservationNameFallsBackToObservationShape(t *testing.
 	}
 
 	got := anytypeHistoricalObservationName(observation, "")
-	want := "3389 MS-WBT-SERVER - 172.16.10.50 @ 2026-05-24T19:33:42Z"
+	want := "3389 MS-WBT-SERVER - 172.16.10.50"
 	if got != want {
 		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestAnytypeServicePropertiesIncludeAliases(t *testing.T) {
+	properties := anytypeServiceProperties(AnytypeOptions{
+		AliasPropertyKey:      "alias",
+		PortPropertyKey:       "port",
+		StatePropertyKey:      "state",
+		ServicePropertyKey:    "service",
+		BannerPropertyKey:     "banner",
+		EngagementPropertyKey: "engagement",
+		AssetPropertyKey:      "asset",
+	}, "eng-1", "asset-1", []string{"api.example.com", "admin.example.com"}, storage.PortScanRecord{
+		Port:     443,
+		Protocol: "tcp",
+		State:    "open",
+		Service:  "https",
+		Version:  "nginx",
+	})
+
+	if len(properties) != 7 {
+		t.Fatalf("len(properties)=%d; want 7", len(properties))
+	}
+	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
+		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
 	}
 }
 
