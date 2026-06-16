@@ -50,6 +50,8 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.Version, "anytype-version", envOrDefault("ANYTYPE_VERSION", defaultAnytypeVersion), "Anytype API version header")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ConfigPath, "config", defaultConfigPath(), "path to logy's config yaml")
 	exportAnytypeCmd.Flags().BoolVar(&anytypeExport.OnlyScans, "only-scans", false, "export only Scan objects")
+	// Suspicious hosts keep scan evidence, but skip structured service inventory.
+	exportAnytypeCmd.Flags().IntVar(&anytypeExport.SuspiciousOpenPorts, "suspicious-open-ports", 256, "skip Service and Service historical observation export for hosts with at least this many open ports; 0 disables filtering")
 	exportAnytypeCmd.Flags().BoolVar(&anytypeExport.Yes, "yes", false, "skip interactive export confirmation")
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementTypeKey, "engagement-type", "engagement", "Anytype type key for Engagement objects")
@@ -214,29 +216,33 @@ func runExportAnytype(cmd *cobra.Command) error {
 		}
 	}
 
+	// Export uses the same preview inputs so suspicious-host counts stay aligned.
 	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
 	if err != nil {
 		return err
 	}
 
 	summary := struct {
-		Domain                               string `json:"domain"`
-		Engagement                           string `json:"engagement"`
-		EngagementID                         string `json:"engagement_id"`
-		Database                             string `json:"database"`
-		AssetsCreated                        int    `json:"assets_created"`
-		AssetsReused                         int    `json:"assets_reused"`
-		AssetsUpdated                        int    `json:"assets_updated"`
-		ServicesCreated                      int    `json:"services_created"`
-		ServicesReused                       int    `json:"services_reused"`
-		WebAppObservationsCreated            int    `json:"web_app_observations_created"`
-		WebAppObservationsSkipped            int    `json:"web_app_observations_skipped"`
-		ServiceHistoricalObservationsCreated int    `json:"service_historical_observations_created"`
-		ServiceHistoricalObservationsSkipped int    `json:"service_historical_observations_skipped"`
-		ScansCreated                         int    `json:"scans_created"`
-		ScansSkipped                         int    `json:"scans_skipped"`
-		AnytypeSpace                         string `json:"anytype_space"`
-		AnytypeURL                           string `json:"anytype_url"`
+		Domain                                       string `json:"domain"`
+		Engagement                                   string `json:"engagement"`
+		EngagementID                                 string `json:"engagement_id"`
+		Database                                     string `json:"database"`
+		AssetsCreated                                int    `json:"assets_created"`
+		AssetsReused                                 int    `json:"assets_reused"`
+		AssetsUpdated                                int    `json:"assets_updated"`
+		ServicesCreated                              int    `json:"services_created"`
+		ServicesReused                               int    `json:"services_reused"`
+		SuspiciousHosts                              int    `json:"suspicious_hosts"`
+		ServicesSkippedSuspiciousHosts               int    `json:"services_skipped_suspicious_hosts"`
+		WebAppObservationsCreated                    int    `json:"web_app_observations_created"`
+		WebAppObservationsSkipped                    int    `json:"web_app_observations_skipped"`
+		ServiceHistoricalObservationsCreated         int    `json:"service_historical_observations_created"`
+		ServiceHistoricalObservationsSkipped         int    `json:"service_historical_observations_skipped"`
+		HistoricalObservationsSkippedSuspiciousHosts int    `json:"historical_observations_skipped_suspicious_hosts"`
+		ScansCreated                                 int    `json:"scans_created"`
+		ScansSkipped                                 int    `json:"scans_skipped"`
+		AnytypeSpace                                 string `json:"anytype_space"`
+		AnytypeURL                                   string `json:"anytype_url"`
 	}{
 		Domain:                               result.Domain,
 		Engagement:                           result.Engagement,
@@ -247,14 +253,17 @@ func runExportAnytype(cmd *cobra.Command) error {
 		AssetsUpdated:                        result.AssetsUpdated,
 		ServicesCreated:                      result.ServicesCreated,
 		ServicesReused:                       result.ServicesReused,
+		SuspiciousHosts:                      result.SuspiciousHosts,
+		ServicesSkippedSuspiciousHosts:       result.ServicesSkippedSuspiciousHosts,
 		WebAppObservationsCreated:            result.WebAppObservationsCreated,
 		WebAppObservationsSkipped:            result.WebAppObservationsSkipped,
 		ServiceHistoricalObservationsCreated: result.ServiceHistoricalObservationsCreated,
 		ServiceHistoricalObservationsSkipped: result.ServiceHistoricalObservationsSkipped,
-		ScansCreated:                         result.ScansCreated,
-		ScansSkipped:                         result.ScansSkipped,
-		AnytypeSpace:                         result.AnytypeSpace,
-		AnytypeURL:                           result.AnytypeURL,
+		HistoricalObservationsSkippedSuspiciousHosts: result.HistoricalObservationsSkippedSuspiciousHosts,
+		ScansCreated: result.ScansCreated,
+		ScansSkipped: result.ScansSkipped,
+		AnytypeSpace: result.AnytypeSpace,
+		AnytypeURL:   result.AnytypeURL,
 	}
 
 	enc := json.NewEncoder(os.Stdout)
@@ -277,8 +286,11 @@ func confirmAnytypeExport(preview exporter.AnytypePreview) error {
 	fmt.Fprintf(os.Stderr, "  url:           %s\n", preview.AnytypeURL)
 	fmt.Fprintf(os.Stderr, "  assets:        %d\n", preview.Assets)
 	fmt.Fprintf(os.Stderr, "  services:      %d\n", preview.Services)
+	fmt.Fprintf(os.Stderr, "  suspicious hosts: %d\n", preview.SuspiciousHosts)
+	fmt.Fprintf(os.Stderr, "  services skipped: %d\n", preview.ServicesSkippedSuspiciousHosts)
 	fmt.Fprintf(os.Stderr, "  web apps:      %d\n", preview.WebAppObservations)
 	fmt.Fprintf(os.Stderr, "  history:       %d\n", preview.ServiceHistoricalObservations)
+	fmt.Fprintf(os.Stderr, "  history skipped: %d\n", preview.HistoricalObservationsSkippedSuspiciousHosts)
 	fmt.Fprintf(os.Stderr, "  scans:         %d\n", preview.Scans)
 	answer, err := promptLine("Proceed with export? [y/N]: ")
 	if err != nil {

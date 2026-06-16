@@ -231,6 +231,26 @@ func TestAnytypeWebAppObservationPropertiesStringifyStatusAndJoinTechnologies(t 
 	}
 }
 
+func TestSuspiciousPortscanIPsMarksHostsAtThreshold(t *testing.T) {
+	scans := []storage.PortScanRecord{
+		{IP: "10.0.0.1", Port: 80},
+		{IP: "10.0.0.1", Port: 443},
+		{IP: "10.0.0.2", Port: 22},
+	}
+
+	got := suspiciousPortscanIPs(scans, 2)
+	if _, ok := got["10.0.0.1"]; !ok {
+		t.Fatal("expected 10.0.0.1 to be suspicious")
+	}
+	if _, ok := got["10.0.0.2"]; ok {
+		t.Fatal("expected 10.0.0.2 to stay below threshold")
+	}
+
+	if disabled := suspiciousPortscanIPs(scans, 0); disabled != nil {
+		t.Fatalf("disabled filtering=%v; want nil", disabled)
+	}
+}
+
 func TestObjectLinkedToEngagementVerifiesRelationWhenPresent(t *testing.T) {
 	object := map[string]any{
 		"properties": []any{
