@@ -20,14 +20,15 @@ import (
 // AnytypeOptions contains connection settings plus Anytype type/property keys
 // needed to map logy's stored recon data into the user's Anytype workspace.
 type AnytypeOptions struct {
-	Domain         string
-	EngagementName string
-	DatabasePath   string
-	SpaceID        string
-	BaseURL        string
-	Token          string
-	Version        string
-	OnlyScans      bool
+	Domain              string
+	EngagementName      string
+	DatabasePath        string
+	SpaceID             string
+	BaseURL             string
+	Token               string
+	Version             string
+	OnlyScans           bool
+	SuspiciousOpenPorts int
 
 	EngagementTypeKey                   string
 	AssetTypeKey                        string
@@ -58,36 +59,42 @@ type AnytypeOptions struct {
 
 // AnytypeResult summarizes the objects created during an Anytype export run.
 type AnytypeResult struct {
-	Domain                               string
-	Engagement                           string
-	EngagementID                         string
-	AssetsCreated                        int
-	AssetsReused                         int
-	AssetsUpdated                        int
-	ServicesCreated                      int
-	ServicesReused                       int
-	WebAppObservationsCreated            int
-	WebAppObservationsSkipped            int
-	ServiceHistoricalObservationsCreated int
-	ServiceHistoricalObservationsSkipped int
-	ScansCreated                         int
-	ScansSkipped                         int
-	AnytypeSpace                         string
-	AnytypeURL                           string
+	Domain                                       string
+	Engagement                                   string
+	EngagementID                                 string
+	AssetsCreated                                int
+	AssetsReused                                 int
+	AssetsUpdated                                int
+	ServicesCreated                              int
+	ServicesReused                               int
+	SuspiciousHosts                              int
+	ServicesSkippedSuspiciousHosts               int
+	WebAppObservationsCreated                    int
+	WebAppObservationsSkipped                    int
+	ServiceHistoricalObservationsCreated         int
+	ServiceHistoricalObservationsSkipped         int
+	HistoricalObservationsSkippedSuspiciousHosts int
+	ScansCreated                                 int
+	ScansSkipped                                 int
+	AnytypeSpace                                 string
+	AnytypeURL                                   string
 }
 
 // AnytypePreview describes what an export would write before creating objects.
 type AnytypePreview struct {
-	Domain                        string
-	Engagement                    string
-	EngagementID                  string
-	Assets                        int
-	Services                      int
-	WebAppObservations            int
-	ServiceHistoricalObservations int
-	Scans                         int
-	AnytypeSpace                  string
-	AnytypeURL                    string
+	Domain                                       string
+	Engagement                                   string
+	EngagementID                                 string
+	Assets                                       int
+	Services                                     int
+	SuspiciousHosts                              int
+	ServicesSkippedSuspiciousHosts               int
+	WebAppObservations                           int
+	ServiceHistoricalObservations                int
+	HistoricalObservationsSkippedSuspiciousHosts int
+	Scans                                        int
+	AnytypeSpace                                 string
+	AnytypeURL                                   string
 }
 
 type anytypeClient struct {
@@ -143,6 +150,8 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	}
 
 	client := newAnytypeClient(opts)
+	// Suspicious hosts still keep their Scan and web probe evidence.
+	suspiciousHosts := suspiciousPortscanIPs(scans, opts.SuspiciousOpenPorts)
 
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
@@ -191,11 +200,17 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 
 	createdServices := 0
 	reusedServices := 0
+	servicesSkippedSuspiciousHosts := 0
 	// Reuse the same service identity later when we attach historical evidence.
 	serviceIDByKey := make(map[string]string, len(scans))
 	serviceNameByKey := make(map[string]string, len(scans))
 	if !opts.OnlyScans {
 		for _, scan := range scans {
+			// Drop clearly implausible host inventories before they become Service objects.
+			if _, ok := suspiciousHosts[strings.TrimSpace(scan.IP)]; ok {
+				servicesSkippedSuspiciousHosts++
+				continue
+			}
 			assetID := assetIDByIP[scan.IP]
 			if assetID == "" {
 				continue
@@ -233,10 +248,16 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 
 	createdHistorical := 0
 	skippedHistorical := 0
+	historicalSkippedSuspiciousHosts := 0
 	if !opts.OnlyScans {
 		for _, observation := range observations {
 			// Historical observations only make sense when they point at a stable
 			// service object from the same export run.
+			// Suspicious hosts skip service history for the same reason as Services.
+			if _, ok := suspiciousHosts[strings.TrimSpace(observation.HostIP)]; ok {
+				historicalSkippedSuspiciousHosts++
+				continue
+			}
 			serviceKey := anytypeServiceObservationKey(observation.HostIP, observation.Port, observation.Protocol)
 			serviceID := serviceIDByKey[serviceKey]
 			serviceName := serviceNameByKey[serviceKey]
@@ -347,14 +368,17 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		AssetsUpdated:                        updatedAssets,
 		ServicesCreated:                      createdServices,
 		ServicesReused:                       reusedServices,
+		SuspiciousHosts:                      len(suspiciousHosts),
+		ServicesSkippedSuspiciousHosts:       servicesSkippedSuspiciousHosts,
 		WebAppObservationsCreated:            createdWebApps,
 		WebAppObservationsSkipped:            skippedWebApps,
 		ServiceHistoricalObservationsCreated: createdHistorical,
 		ServiceHistoricalObservationsSkipped: skippedHistorical,
-		ScansCreated:                         createdScans,
-		ScansSkipped:                         skippedScans,
-		AnytypeSpace:                         opts.SpaceID,
-		AnytypeURL:                           opts.BaseURL,
+		HistoricalObservationsSkippedSuspiciousHosts: historicalSkippedSuspiciousHosts,
+		ScansCreated: createdScans,
+		ScansSkipped: skippedScans,
+		AnytypeSpace: opts.SpaceID,
+		AnytypeURL:   opts.BaseURL,
 	}, nil
 }
 
@@ -371,6 +395,7 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 	}
 
 	client := newAnytypeClient(opts)
+	suspiciousHosts := suspiciousPortscanIPs(scans, opts.SuspiciousOpenPorts)
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
 		return AnytypePreview{}, err
@@ -379,17 +404,28 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 	serviceCount := 0
 	webAppCount := 0
 	historicalCount := 0
+	servicesSkippedSuspiciousHosts := 0
+	historicalSkippedSuspiciousHosts := 0
 	if !opts.OnlyScans {
 		assetIPs := make(map[string]struct{}, len(assets))
 		for _, asset := range assets {
 			assetIPs[asset.IP] = struct{}{}
 		}
 		for _, scan := range scans {
+			// Preview uses the same suspicious-host filter as the real export path.
+			if _, ok := suspiciousHosts[strings.TrimSpace(scan.IP)]; ok {
+				servicesSkippedSuspiciousHosts++
+				continue
+			}
 			if _, ok := assetIPs[scan.IP]; ok {
 				serviceCount++
 			}
 		}
 		for _, observation := range observations {
+			if _, ok := suspiciousHosts[strings.TrimSpace(observation.HostIP)]; ok {
+				historicalSkippedSuspiciousHosts++
+				continue
+			}
 			// Preview only counts observations that would produce a new historical object.
 			if collidesWithCurrentService(observation, scans) {
 				historicalCount++
@@ -400,16 +436,19 @@ func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []stora
 	}
 
 	return AnytypePreview{
-		Domain:                        opts.Domain,
-		Engagement:                    opts.EngagementName,
-		EngagementID:                  engagementID,
-		Assets:                        len(assets),
-		Services:                      serviceCount,
-		WebAppObservations:            webAppCount,
-		ServiceHistoricalObservations: historicalCount,
-		Scans:                         len(runs),
-		AnytypeSpace:                  opts.SpaceID,
-		AnytypeURL:                    opts.BaseURL,
+		Domain:                         opts.Domain,
+		Engagement:                     opts.EngagementName,
+		EngagementID:                   engagementID,
+		Assets:                         len(assets),
+		Services:                       serviceCount,
+		SuspiciousHosts:                len(suspiciousHosts),
+		ServicesSkippedSuspiciousHosts: servicesSkippedSuspiciousHosts,
+		WebAppObservations:             webAppCount,
+		ServiceHistoricalObservations:  historicalCount,
+		HistoricalObservationsSkippedSuspiciousHosts: historicalSkippedSuspiciousHosts,
+		Scans:        len(runs),
+		AnytypeSpace: opts.SpaceID,
+		AnytypeURL:   opts.BaseURL,
 	}, nil
 }
 
@@ -423,6 +462,9 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.BaseURL = strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
 	opts.Token = strings.TrimSpace(opts.Token)
 	opts.Version = strings.TrimSpace(opts.Version)
+	if opts.SuspiciousOpenPorts < 0 {
+		opts.SuspiciousOpenPorts = 0
+	}
 	opts.EngagementTypeKey = strings.TrimSpace(opts.EngagementTypeKey)
 	opts.AssetTypeKey = strings.TrimSpace(opts.AssetTypeKey)
 	opts.ServiceTypeKey = strings.TrimSpace(opts.ServiceTypeKey)
@@ -527,6 +569,30 @@ func anytypeWebAppObservationProperties(opts AnytypeOptions, engagementID string
 		textProperty(opts.WebAppObservationTechnologiesPropertyKey, strings.Join(probe.Technologies, ",")),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
 	}
+}
+
+func suspiciousPortscanIPs(scans []storage.PortScanRecord, threshold int) map[string]struct{} {
+	if threshold == 0 {
+		return nil
+	}
+
+	// Count open-port rows per IP and flag hosts that look like portscan traps.
+	counts := make(map[string]int, len(scans))
+	for _, scan := range scans {
+		ip := strings.TrimSpace(scan.IP)
+		if ip == "" {
+			continue
+		}
+		counts[ip]++
+	}
+
+	suspicious := make(map[string]struct{})
+	for ip, count := range counts {
+		if count >= threshold {
+			suspicious[ip] = struct{}{}
+		}
+	}
+	return suspicious
 }
 
 func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord) []anytypeAssetExport {
