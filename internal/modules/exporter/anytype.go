@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/indigo-sadland/logy/internal/storage"
@@ -103,7 +104,13 @@ type anytypeClient struct {
 	token   string
 	version string
 	client  *http.Client
+	limiter *anytypeRateLimiter
 }
+
+const (
+	anytypeSustainedRatePerSecond = 1
+	anytypeBurstSize              = 60
+)
 
 type anytypeProperty map[string]any
 
@@ -651,6 +658,7 @@ func newAnytypeClient(opts AnytypeOptions) anytypeClient {
 		token:   opts.Token,
 		version: opts.Version,
 		client:  http.DefaultClient,
+		limiter: newAnytypeRateLimiter(anytypeSustainedRatePerSecond, anytypeBurstSize),
 	}
 }
 
@@ -944,45 +952,143 @@ func (c anytypeClient) updateObject(ctx context.Context, id string, payload anyt
 }
 
 func (c anytypeClient) doJSON(ctx context.Context, method string, path string, payload any) (map[string]any, error) {
-	var body io.Reader
+	var rawPayload []byte
 	if payload != nil {
-		rawPayload, err := json.Marshal(payload)
+		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return nil, err
 		}
-		body = bytes.NewReader(rawPayload)
+		rawPayload = encoded
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Anytype-Version", c.version)
-	req.Header.Set("Content-Type", "application/json")
+	for attempt := 0; attempt < 3; attempt++ {
+		// Respect Anytype's local burst limiter before sending the next request.
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		var body io.Reader
+		if rawPayload != nil {
+			body = bytes.NewReader(rawPayload)
+		}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Anytype-Version", c.version)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < 2 {
+			if err := waitForAnytypeRateLimitRecovery(ctx); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return nil, fmt.Errorf("Anytype API returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		}
+
+		var out map[string]any
+		if len(bytes.TrimSpace(raw)) == 0 {
+			return map[string]any{}, nil
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("decode Anytype response: %w", err)
+		}
+		return out, nil
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("Anytype API returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	return nil, fmt.Errorf("Anytype API rate limit retries exhausted")
+}
+
+type anytypeRateLimiter struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+	rate   float64
+	burst  float64
+}
+
+func newAnytypeRateLimiter(ratePerSecond float64, burst int) *anytypeRateLimiter {
+	return &anytypeRateLimiter{
+		tokens: float64(burst),
+		last:   time.Now(),
+		rate:   ratePerSecond,
+		burst:  float64(burst),
+	}
+}
+
+func (l *anytypeRateLimiter) Wait(ctx context.Context) error {
+	for {
+		waitFor := l.reserve()
+		if waitFor <= 0 {
+			return nil
+		}
+
+		timer := time.NewTimer(waitFor)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (l *anytypeRateLimiter) reserve() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(l.last).Seconds()
+	if elapsed > 0 {
+		l.tokens += elapsed * l.rate
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		l.last = now
 	}
 
-	var out map[string]any
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return map[string]any{}, nil
+	if l.tokens >= 1 {
+		l.tokens--
+		return 0
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode Anytype response: %w", err)
+
+	missing := 1 - l.tokens
+	waitSeconds := missing / l.rate
+	if waitSeconds <= 0 {
+		return 0
 	}
-	return out, nil
+	return time.Duration(waitSeconds * float64(time.Second))
+}
+
+func waitForAnytypeRateLimitRecovery(ctx context.Context) error {
+	timer := time.NewTimer(time.Second)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func extractAnytypeObjectIDByName(raw map[string]any, wantName string) string {
