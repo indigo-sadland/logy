@@ -30,6 +30,7 @@ type AnytypeOptions struct {
 	Version             string
 	OnlyScans           bool
 	SuspiciousOpenPorts int
+	Progress            func(AnytypeProgress)
 
 	EngagementTypeKey                   string
 	AssetTypeKey                        string
@@ -98,6 +99,13 @@ type AnytypePreview struct {
 	AnytypeURL                                   string
 }
 
+// AnytypeProgress reports exporter progress across object families.
+type AnytypeProgress struct {
+	Phase     string
+	Completed int
+	Total     int
+}
+
 type anytypeClient struct {
 	baseURL string
 	spaceID string
@@ -159,11 +167,13 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	client := newAnytypeClient(opts)
 	// Suspicious hosts still keep their Scan and web probe evidence.
 	suspiciousHosts := suspiciousPortscanIPs(scans, opts.SuspiciousOpenPorts)
+	progress := newAnytypeProgressState(opts, scans, observations, webProbes, runs, suspiciousHosts)
 
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
 		return AnytypeResult{}, err
 	}
+	progress.report("engagement")
 
 	createdAssets := 0
 	reusedAssets := 0
@@ -182,6 +192,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 				} else if updated {
 					updatedAssets++
 				}
+				progress.report("assets")
 				continue
 			}
 
@@ -195,6 +206,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			assets[i].ID = assetID
 			createdAssets++
+			progress.report("assets")
 		}
 	}
 
@@ -235,6 +247,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 					serviceIDByKey[serviceKey] = existing.ID
 					serviceNameByKey[serviceKey] = serviceName
 				}
+				progress.report("services")
 				continue
 			}
 			serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
@@ -250,6 +263,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 				serviceIDByKey[serviceKey] = serviceID
 				serviceNameByKey[serviceKey] = serviceName
 			}
+			progress.report("services")
 		}
 	}
 
@@ -281,6 +295,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if exists {
 				skippedHistorical++
+				progress.report("history")
 				continue
 			}
 			observationID, err := client.createObject(ctx, anytypeCreateObjectRequest{
@@ -294,6 +309,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if observationID != "" {
 				createdHistorical++
 			}
+			progress.report("history")
 		}
 	}
 
@@ -312,6 +328,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if exists {
 				skippedWebApps++
+				progress.report("web-apps")
 				continue
 			}
 			objectID, err := client.createObject(ctx, anytypeCreateObjectRequest{
@@ -325,6 +342,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if objectID != "" {
 				createdWebApps++
 			}
+			progress.report("web-apps")
 		}
 	}
 
@@ -342,9 +360,11 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if !updated {
 				skippedScans++
+				progress.report("scans")
 				continue
 			}
 			skippedScans++
+			progress.report("scans")
 			continue
 		}
 		markdown, err := commandRunMarkdown(run, opts.DatabasePath)
@@ -364,6 +384,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		if scanID != "" {
 			createdScans++
 		}
+		progress.report("scans")
 	}
 
 	return AnytypeResult{
@@ -387,6 +408,66 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		AnytypeSpace: opts.SpaceID,
 		AnytypeURL:   opts.BaseURL,
 	}, nil
+}
+
+type anytypeProgressState struct {
+	completed int
+	total     int
+	reportFn  func(AnytypeProgress)
+}
+
+// Build one stable total up front so the CLI bar does not jump between phases.
+func newAnytypeProgressState(opts AnytypeOptions, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord, suspiciousHosts map[string]struct{}) *anytypeProgressState {
+	if opts.Progress == nil {
+		return &anytypeProgressState{}
+	}
+
+	total := 1 + len(runs) // engagement lookup + scans
+	if !opts.OnlyScans {
+		total += countExportableServices(scans, suspiciousHosts)
+		total += countExportableHistoricalObservations(observations, scans, suspiciousHosts)
+		total += len(webProbes)
+	}
+	return &anytypeProgressState{total: total, reportFn: opts.Progress}
+}
+
+// Every completed lookup or object sync advances the shared export bar by one step.
+func (p *anytypeProgressState) report(phase string) {
+	if p.reportFn == nil {
+		return
+	}
+	p.completed++
+	p.reportFn(AnytypeProgress{
+		Phase:     phase,
+		Completed: p.completed,
+		Total:     p.total,
+	})
+}
+
+// Services skipped by the suspicious-host filter never reach Anytype, so preview drops them too.
+func countExportableServices(scans []storage.PortScanRecord, suspiciousHosts map[string]struct{}) int {
+	total := 0
+	for _, scan := range scans {
+		if _, ok := suspiciousHosts[strings.TrimSpace(scan.IP)]; ok {
+			continue
+		}
+		total++
+	}
+	return total
+}
+
+// History progress only counts observations that survive filtering and actually differ from the current service row.
+func countExportableHistoricalObservations(observations []storage.ServiceHistoricalObservationRecord, scans []storage.PortScanRecord, suspiciousHosts map[string]struct{}) int {
+	total := 0
+	for _, observation := range observations {
+		if _, ok := suspiciousHosts[strings.TrimSpace(observation.HostIP)]; ok {
+			continue
+		}
+		if collidesWithCurrentService(observation, scans) {
+			total++
+		}
+	}
+	return total
 }
 
 // PreviewAnytype resolves the target engagement and counts the objects that would be created without mutating Anytype.
@@ -658,6 +739,7 @@ func newAnytypeClient(opts AnytypeOptions) anytypeClient {
 		token:   opts.Token,
 		version: opts.Version,
 		client:  http.DefaultClient,
+		// Match Anytype's documented burst and sustained request limits locally.
 		limiter: newAnytypeRateLimiter(anytypeSustainedRatePerSecond, anytypeBurstSize),
 	}
 }
@@ -994,6 +1076,7 @@ func (c anytypeClient) doJSON(ctx context.Context, method string, path string, p
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests && attempt < 2 {
+			// A short backoff lets the local Anytype limiter refill before retrying.
 			if err := waitForAnytypeRateLimitRecovery(ctx); err != nil {
 				return nil, err
 			}
@@ -1023,6 +1106,7 @@ type anytypeRateLimiter struct {
 	burst  float64
 }
 
+// Use a small token bucket so large exports can burst briefly without outrunning Anytype.
 func newAnytypeRateLimiter(ratePerSecond float64, burst int) *anytypeRateLimiter {
 	return &anytypeRateLimiter{
 		tokens: float64(burst),
@@ -1032,6 +1116,7 @@ func newAnytypeRateLimiter(ratePerSecond float64, burst int) *anytypeRateLimiter
 	}
 }
 
+// Wait blocks until one request slot is available or the caller cancels the export.
 func (l *anytypeRateLimiter) Wait(ctx context.Context) error {
 	for {
 		waitFor := l.reserve()
@@ -1051,6 +1136,7 @@ func (l *anytypeRateLimiter) Wait(ctx context.Context) error {
 	}
 }
 
+// reserve refills elapsed tokens and returns how long the next request must wait.
 func (l *anytypeRateLimiter) reserve() time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1078,6 +1164,7 @@ func (l *anytypeRateLimiter) reserve() time.Duration {
 	return time.Duration(waitSeconds * float64(time.Second))
 }
 
+// Give Anytype a brief cool-down after a 429 before retrying the same request.
 func waitForAnytypeRateLimitRecovery(ctx context.Context) error {
 	timer := time.NewTimer(time.Second)
 	select {

@@ -251,6 +251,29 @@ func TestSuspiciousPortscanIPsMarksHostsAtThreshold(t *testing.T) {
 	}
 }
 
+func TestNewAnytypeProgressStateCountsExportableWork(t *testing.T) {
+	suspicious := map[string]struct{}{"10.0.0.2": {}}
+	progress := newAnytypeProgressState(AnytypeOptions{
+		OnlyScans: false,
+		Progress:  func(AnytypeProgress) {},
+	}, []storage.PortScanRecord{
+		{IP: "10.0.0.1", Port: 80, Protocol: "tcp", State: "open", Service: "http", Version: "nginx"},
+		{IP: "10.0.0.2", Port: 1, Protocol: "tcp", State: "open", Service: "tcpwrapped", Version: ""},
+	}, []storage.ServiceHistoricalObservationRecord{
+		{HostIP: "10.0.0.1", Port: 80, Protocol: "tcp", ObservedState: "open", ObservedService: "http", ObservedBanner: "Apache"},
+		{HostIP: "10.0.0.2", Port: 1, Protocol: "tcp", ObservedState: "open", ObservedService: "tcpwrapped", ObservedBanner: ""},
+	}, []storage.WebProbeRecord{
+		{URL: "https://app.example.com"},
+	}, []storage.CommandRunRecord{
+		{Command: "nmap -Pn app.example.com"},
+	}, suspicious)
+
+	// engagement lookup + 1 service + 1 historical observation + 1 web app + 1 scan
+	if progress.total != 5 {
+		t.Fatalf("progress.total=%d; want 5", progress.total)
+	}
+}
+
 func TestObjectLinkedToEngagementVerifiesRelationWhenPresent(t *testing.T) {
 	object := map[string]any{
 		"properties": []any{

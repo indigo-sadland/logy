@@ -12,6 +12,7 @@ import (
 	"github.com/indigo-sadland/logy/internal/modules/exporter"
 	"github.com/indigo-sadland/logy/internal/storage"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -216,6 +217,12 @@ func runExportAnytype(cmd *cobra.Command) error {
 		}
 	}
 
+	progress := newAnytypeProgressBar()
+	defer progress.finish()
+	if progress.enabled {
+		opts.Progress = progress.report
+	}
+
 	// Export uses the same preview inputs so suspicious-host counts stay aligned.
 	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
 	if err != nil {
@@ -308,4 +315,51 @@ func envOrDefault(key string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+type anytypeProgressBar struct {
+	enabled bool
+	lastLen int
+}
+
+// Render live progress only in interactive terminals so JSON output stays clean.
+func newAnytypeProgressBar() *anytypeProgressBar {
+	return &anytypeProgressBar{
+		enabled: isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd()),
+	}
+}
+
+// Rewrite one stderr line in place as each exporter step completes.
+func (p *anytypeProgressBar) report(progress exporter.AnytypeProgress) {
+	if !p.enabled {
+		return
+	}
+
+	total := progress.Total
+	if total <= 0 {
+		total = 1
+	}
+	completed := progress.Completed
+	if completed > total {
+		completed = total
+	}
+
+	const width = 24
+	filled := completed * width / total
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+	line := fmt.Sprintf("\r[*] anytype export: [%s] %d/%d phase=%s", bar, completed, total, progress.Phase)
+	if pad := p.lastLen - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	fmt.Fprint(os.Stderr, line)
+	p.lastLen = len(line)
+}
+
+// Finish the in-place line so later stderr or shell output starts cleanly.
+func (p *anytypeProgressBar) finish() {
+	if !p.enabled || p.lastLen == 0 {
+		return
+	}
+	fmt.Fprint(os.Stderr, "\n")
+	p.lastLen = 0
 }
