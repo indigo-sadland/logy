@@ -90,6 +90,20 @@ func TestMergeAliasValuesPreservesExistingAliases(t *testing.T) {
 	}
 }
 
+func TestAnytypeAssetPropertiesIncludeAliases(t *testing.T) {
+	properties := anytypeAssetProperties(AnytypeOptions{
+		AliasPropertyKey:      "alias",
+		EngagementPropertyKey: "engagement",
+	}, "eng-1", []string{"api.example.com", "admin.example.com"})
+
+	if len(properties) != 2 {
+		t.Fatalf("len(properties)=%d; want 2", len(properties))
+	}
+	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
+		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
+	}
+}
+
 func TestAnytypeServiceObjectNameUsesIPIdentity(t *testing.T) {
 	got := anytypeServiceObjectName(testPortScan("203.0.113.20", 443, "tcp", "https"))
 	want := "443 HTTPS - 203.0.113.20"

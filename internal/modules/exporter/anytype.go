@@ -204,6 +204,11 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
 			}
+			// Patch the asset once after creation so alias and engagement land the
+			// same way on both new and reused Asset objects.
+			if err := client.setAssetProperties(ctx, assetID, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+				return AnytypeResult{}, fmt.Errorf("update Anytype asset %s properties: %w", assets[i].IP, err)
+			}
 			assets[i].ID = assetID
 			createdAssets++
 			progress.report("assets")
@@ -911,6 +916,16 @@ func (c anytypeClient) mergeAssetAliases(ctx context.Context, object *anytypeObj
 		return false, err
 	}
 	return true, nil
+}
+
+func (c anytypeClient) setAssetProperties(ctx context.Context, id string, aliasPropertyKey string, engagementPropertyKey string, engagementID string, aliases []string) error {
+	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
+		Properties: anytypeAssetProperties(AnytypeOptions{
+			AliasPropertyKey:      aliasPropertyKey,
+			EngagementPropertyKey: engagementPropertyKey,
+		}, engagementID, aliases),
+	})
+	return err
 }
 
 func (c anytypeClient) mergeServiceAliases(ctx context.Context, object *anytypeObject, aliasPropertyKey string, aliases []string) (bool, error) {
