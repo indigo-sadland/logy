@@ -4,6 +4,7 @@ import (
 	"github.com/indigo-sadland/logy/internal/storage"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -92,12 +93,15 @@ func TestMergeAliasValuesPreservesExistingAliases(t *testing.T) {
 
 func TestAnytypeAssetPropertiesIncludeAliases(t *testing.T) {
 	properties := anytypeAssetProperties(AnytypeOptions{
-		AliasPropertyKey:      "alias",
+		AssetAliasPropertyKey: "asset_alias",
 		EngagementPropertyKey: "engagement",
 	}, "eng-1", []string{"api.example.com", "admin.example.com"})
 
 	if len(properties) != 2 {
 		t.Fatalf("len(properties)=%d; want 2", len(properties))
+	}
+	if got := properties[0]["key"]; got != "asset_alias" {
+		t.Fatalf("key=%v; want asset_alias", got)
 	}
 	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
 		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
@@ -155,13 +159,13 @@ func TestAnytypeHistoricalObservationNameFallsBackToObservationShape(t *testing.
 
 func TestAnytypeServicePropertiesIncludeAliases(t *testing.T) {
 	properties := anytypeServiceProperties(AnytypeOptions{
-		AliasPropertyKey:      "alias",
-		PortPropertyKey:       "port",
-		StatePropertyKey:      "state",
-		ServicePropertyKey:    "service",
-		BannerPropertyKey:     "banner",
-		EngagementPropertyKey: "engagement",
-		AssetPropertyKey:      "asset",
+		ServiceAliasPropertyKey: "service_alias",
+		PortPropertyKey:         "port",
+		StatePropertyKey:        "state",
+		ServicePropertyKey:      "service",
+		BannerPropertyKey:       "banner",
+		EngagementPropertyKey:   "engagement",
+		AssetPropertyKey:        "asset",
 	}, "eng-1", "asset-1", []string{"api.example.com", "admin.example.com"}, storage.PortScanRecord{
 		Port:     443,
 		Protocol: "tcp",
@@ -173,8 +177,52 @@ func TestAnytypeServicePropertiesIncludeAliases(t *testing.T) {
 	if len(properties) != 7 {
 		t.Fatalf("len(properties)=%d; want 7", len(properties))
 	}
+	if got := properties[0]["key"]; got != "service_alias" {
+		t.Fatalf("key=%v; want service_alias", got)
+	}
 	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
 		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
+	}
+}
+
+func TestNormalizeAnytypeOptionsFallsBackToSharedAliasProperty(t *testing.T) {
+	opts := NormalizeAnytypeOptions(AnytypeOptions{
+		AliasPropertyKey: "alias",
+	})
+
+	if opts.AssetAliasPropertyKey != "alias" {
+		t.Fatalf("asset alias=%q; want alias", opts.AssetAliasPropertyKey)
+	}
+	if opts.ServiceAliasPropertyKey != "alias" {
+		t.Fatalf("service alias=%q; want alias", opts.ServiceAliasPropertyKey)
+	}
+}
+
+func TestWalkAnytypeSearchPagesAdvancesOffsetsUntilMatch(t *testing.T) {
+	var offsets []int
+	err := walkAnytypeSearchPages(func(offset, limit int) ([]map[string]any, error) {
+		offsets = append(offsets, offset)
+		switch offset {
+		case 0:
+			return []map[string]any{
+				{"name": "first"},
+				{"name": "second"},
+			}, nil
+		case 2:
+			return []map[string]any{
+				{"name": "wanted"},
+			}, nil
+		default:
+			return nil, nil
+		}
+	}, 2, func(candidate map[string]any) (bool, error) {
+		return candidate["name"] == "wanted", nil
+	})
+	if err != nil {
+		t.Fatalf("walkAnytypeSearchPages: %v", err)
+	}
+	if !reflect.DeepEqual(offsets, []int{0, 2}) {
+		t.Fatalf("offsets=%v; want [0 2]", offsets)
 	}
 }
 

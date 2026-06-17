@@ -40,6 +40,8 @@ type AnytypeOptions struct {
 	ServiceHistoricalObservationTypeKey string
 
 	AliasPropertyKey                                string
+	AssetAliasPropertyKey                           string
+	ServiceAliasPropertyKey                         string
 	EngagementPropertyKey                           string
 	AssetPropertyKey                                string
 	PortPropertyKey                                 string
@@ -118,6 +120,7 @@ type anytypeClient struct {
 const (
 	anytypeSustainedRatePerSecond = 1
 	anytypeBurstSize              = 60
+	anytypeSearchPageSize         = 100
 )
 
 type anytypeProperty map[string]any
@@ -187,7 +190,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if existing != nil {
 				assets[i].ID = existing.ID
 				reusedAssets++
-				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
 					return AnytypeResult{}, fmt.Errorf("update Anytype asset %s aliases: %w", assets[i].IP, err)
 				} else if updated {
 					updatedAssets++
@@ -206,7 +209,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			// Patch the asset once after creation so alias and engagement land the
 			// same way on both new and reused Asset objects.
-			if err := client.setAssetProperties(ctx, assetID, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+			if err := client.setAssetProperties(ctx, assetID, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
 				return AnytypeResult{}, fmt.Errorf("update Anytype asset %s properties: %w", assets[i].IP, err)
 			}
 			assets[i].ID = assetID
@@ -247,7 +250,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if existing != nil {
 				reusedServices++
-				if _, err := client.mergeServiceAliases(ctx, existing, opts.AliasPropertyKey, aliasesByIP[scan.IP]); err != nil {
+				if _, err := client.mergeServiceAliases(ctx, existing, opts.ServiceAliasPropertyKey, aliasesByIP[scan.IP]); err != nil {
 					return AnytypeResult{}, fmt.Errorf("update Anytype service %s:%d/%s aliases: %w", scan.IP, scan.Port, scan.Protocol, err)
 				}
 				serviceIDByKey[serviceKey] = existing.ID
@@ -565,6 +568,8 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.WebAppObservationTypeKey = strings.TrimSpace(opts.WebAppObservationTypeKey)
 	opts.ServiceHistoricalObservationTypeKey = strings.TrimSpace(opts.ServiceHistoricalObservationTypeKey)
 	opts.AliasPropertyKey = strings.TrimSpace(opts.AliasPropertyKey)
+	opts.AssetAliasPropertyKey = strings.TrimSpace(opts.AssetAliasPropertyKey)
+	opts.ServiceAliasPropertyKey = strings.TrimSpace(opts.ServiceAliasPropertyKey)
 	opts.EngagementPropertyKey = strings.TrimSpace(opts.EngagementPropertyKey)
 	opts.AssetPropertyKey = strings.TrimSpace(opts.AssetPropertyKey)
 	opts.PortPropertyKey = strings.TrimSpace(opts.PortPropertyKey)
@@ -582,6 +587,12 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.HistoricalObservationObservedBannerPropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedBannerPropertyKey)
 	opts.HistoricalObservationObservedServicePropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedServicePropertyKey)
 	opts.HistoricalObservationTimestampPropertyKey = strings.TrimSpace(opts.HistoricalObservationTimestampPropertyKey)
+	if opts.AssetAliasPropertyKey == "" {
+		opts.AssetAliasPropertyKey = opts.AliasPropertyKey
+	}
+	if opts.ServiceAliasPropertyKey == "" {
+		opts.ServiceAliasPropertyKey = opts.AliasPropertyKey
+	}
 	return opts
 }
 
@@ -603,6 +614,8 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
 	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.WebAppObservationTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
+	case opts.AssetAliasPropertyKey == "" || opts.ServiceAliasPropertyKey == "":
+		return fmt.Errorf("Anytype alias property keys must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
 	case opts.WebAppObservationTitlePropertyKey == "" || opts.WebAppObservationStatusCodePropertyKey == "" || opts.WebAppObservationTechnologiesPropertyKey == "":
@@ -626,14 +639,14 @@ func anytypeCommandRunProperties(opts AnytypeOptions, engagementID string, run s
 
 func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []string) []anytypeProperty {
 	return []anytypeProperty{
-		textProperty(opts.AliasPropertyKey, strings.Join(aliases, ", ")),
+		textProperty(opts.AssetAliasPropertyKey, strings.Join(aliases, ", ")),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
 	}
 }
 
 func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, aliases []string, scan storage.PortScanRecord) []anytypeProperty {
 	return []anytypeProperty{
-		textProperty(opts.AliasPropertyKey, strings.Join(aliases, ", ")),
+		textProperty(opts.ServiceAliasPropertyKey, strings.Join(aliases, ", ")),
 		textProperty(opts.PortPropertyKey, anytypePortValue(scan.Port, scan.Protocol)),
 		textProperty(opts.StatePropertyKey, scan.State),
 		textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
@@ -848,15 +861,17 @@ func objectsProperty(key string, ids ...string) anytypeProperty {
 }
 
 func (c anytypeClient) findObjectByName(ctx context.Context, typeKey string, name string) (string, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=20", body)
+	var id string
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
+		if strings.EqualFold(anytypeObjectName(candidate), strings.TrimSpace(name)) {
+			id = anytypeString(candidate["id"])
+			return id != "", nil
+		}
+		return false, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("search Anytype engagement %q: %w", name, err)
 	}
-	id := extractAnytypeObjectIDByName(raw, name)
 	if id == "" {
 		return "", fmt.Errorf("Anytype engagement %q was not found\n", name)
 	}
@@ -864,30 +879,27 @@ func (c anytypeClient) findObjectByName(ctx context.Context, typeKey string, nam
 }
 
 func (c anytypeClient) findObjectByExactName(ctx context.Context, typeKey string, name string) (*anytypeObject, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
-	if err != nil {
-		return nil, err
-	}
+	var found *anytypeObject
 	name = strings.TrimSpace(name)
-	for _, candidate := range anytypeResponseObjects(raw) {
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
 		if anytypeObjectName(candidate) != name {
-			continue
+			return false, nil
 		}
 		id := anytypeString(candidate["id"])
 		if id == "" {
-			continue
+			return false, nil
 		}
 		full, err := c.getObject(ctx, id)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		return &anytypeObject{ID: id, Raw: full}, nil
+		found = &anytypeObject{ID: id, Raw: full}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return found, nil
 }
 
 func (c anytypeClient) getObject(ctx context.Context, id string) (map[string]any, error) {
@@ -921,7 +933,7 @@ func (c anytypeClient) mergeAssetAliases(ctx context.Context, object *anytypeObj
 func (c anytypeClient) setAssetProperties(ctx context.Context, id string, aliasPropertyKey string, engagementPropertyKey string, engagementID string, aliases []string) error {
 	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
 		Properties: anytypeAssetProperties(AnytypeOptions{
-			AliasPropertyKey:      aliasPropertyKey,
+			AssetAliasPropertyKey: aliasPropertyKey,
 			EngagementPropertyKey: engagementPropertyKey,
 		}, engagementID, aliases),
 	})
@@ -962,51 +974,47 @@ func (c anytypeClient) findExistingService(ctx context.Context, typeKey string, 
 }
 
 func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, command string, startedAt string, timestampPropertyKey string) (*anytypeObject, error) {
-	body := map[string]any{
-		"query": command,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
-	if err != nil {
-		return nil, err
-	}
+	var found *anytypeObject
 	command = strings.TrimSpace(command)
-	for _, candidate := range anytypeResponseObjects(raw) {
+	err := c.walkSearchResults(ctx, typeKey, command, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
 		if anytypeString(candidate["name"]) != command {
-			continue
+			return false, nil
 		}
 		timestamp := anytypePropertyString(candidate, timestampPropertyKey)
 		if timestamp == "" || timestamp == startedAt {
 			id := anytypeString(candidate["id"])
 			if id == "" {
-				continue
+				return false, nil
 			}
-			return &anytypeObject{ID: id, Raw: candidate}, nil
+			found = &anytypeObject{ID: id, Raw: candidate}
+			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return found, nil
 }
 
 func (c anytypeClient) historicalObservationExists(ctx context.Context, typeKey string, name string, observedAt time.Time, timestampPropertyKey string) (bool, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
+	wantName := strings.TrimSpace(name)
+	wantTimestamp := observedAt.UTC().Format(time.RFC3339)
+	found := false
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
+		if anytypeString(candidate["name"]) != wantName {
+			return false, nil
+		}
+		if anytypePropertyString(candidate, timestampPropertyKey) == wantTimestamp {
+			found = true
+			return true, nil
+		}
+		return false, nil
+	})
 	if err != nil {
 		return false, err
 	}
-	wantName := strings.TrimSpace(name)
-	wantTimestamp := observedAt.UTC().Format(time.RFC3339)
-	for _, candidate := range anytypeResponseObjects(raw) {
-		if anytypeString(candidate["name"]) != wantName {
-			continue
-		}
-		if anytypePropertyString(candidate, timestampPropertyKey) == wantTimestamp {
-			return true, nil
-		}
-	}
-	return false, nil
+	return found, nil
 }
 
 func (c anytypeClient) webAppObservationExists(ctx context.Context, typeKey string, name string) (bool, error) {
@@ -1199,6 +1207,52 @@ func waitForAnytypeRateLimitRecovery(ctx context.Context) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// walkSearchResults pages through Anytype search results until the visitor finds a match or results are exhausted.
+func (c anytypeClient) walkSearchResults(ctx context.Context, typeKey string, query string, pageSize int, visit func(map[string]any) (bool, error)) error {
+	if pageSize <= 0 {
+		pageSize = anytypeSearchPageSize
+	}
+	return walkAnytypeSearchPages(func(offset, limit int) ([]map[string]any, error) {
+		body := map[string]any{
+			"query": query,
+			"types": []string{typeKey},
+		}
+		raw, err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/spaces/%s/search?offset=%d&limit=%d", c.spaceID, offset, limit), body)
+		if err != nil {
+			return nil, err
+		}
+		return anytypeResponseObjects(raw), nil
+	}, pageSize, visit)
+}
+
+// walkAnytypeSearchPages keeps advancing offset while each page is full-sized.
+func walkAnytypeSearchPages(fetch func(offset, limit int) ([]map[string]any, error), pageSize int, visit func(map[string]any) (bool, error)) error {
+	if pageSize <= 0 {
+		pageSize = anytypeSearchPageSize
+	}
+	for offset := 0; ; offset += pageSize {
+		candidates, err := fetch(offset, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		for _, candidate := range candidates {
+			stop, err := visit(candidate)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		if len(candidates) < pageSize {
+			return nil
+		}
 	}
 }
 
