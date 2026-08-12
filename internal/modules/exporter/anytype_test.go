@@ -4,6 +4,7 @@ import (
 	"github.com/indigo-sadland/logy/internal/storage"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -90,9 +91,34 @@ func TestMergeAliasValuesPreservesExistingAliases(t *testing.T) {
 	}
 }
 
-func TestAnytypeServiceObjectNamesIncludesAliasAndIPFallback(t *testing.T) {
-	got := anytypeServiceObjectNames(testPortScan("203.0.113.20", 443, "tcp", "https"), []string{"app.example.com"})
-	want := []string{"443 HTTPS - 203.0.113.20", "443 HTTPS - app.example.com"}
+func TestAnytypeAssetPropertiesIncludeAliases(t *testing.T) {
+	properties := anytypeAssetProperties(AnytypeOptions{
+		AssetAliasPropertyKey: "asset_alias",
+		EngagementPropertyKey: "engagement",
+	}, "eng-1", []string{"api.example.com", "admin.example.com"})
+
+	if len(properties) != 2 {
+		t.Fatalf("len(properties)=%d; want 2", len(properties))
+	}
+	if got := properties[0]["key"]; got != "asset_alias" {
+		t.Fatalf("key=%v; want asset_alias", got)
+	}
+	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
+		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
+	}
+}
+
+func TestAnytypeServiceObjectNameUsesIPIdentity(t *testing.T) {
+	got := anytypeServiceObjectName(testPortScan("203.0.113.20", 443, "tcp", "https"))
+	want := "443 HTTPS - 203.0.113.20"
+	if got != want {
+		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestAnytypeServiceReuseNamesPreferIPAndKeepLegacyAliases(t *testing.T) {
+	got := anytypeServiceReuseNames(testPortScan("203.0.113.20", 443, "tcp", "https"), []string{"app.example.com", "admin.example.com"})
+	want := []string{"443 HTTPS - 203.0.113.20", "443 HTTPS - app.example.com", "443 HTTPS - admin.example.com"}
 	if len(got) != len(want) {
 		t.Fatalf("names=%v; want %v", got, want)
 	}
@@ -108,8 +134,8 @@ func TestAnytypeHistoricalObservationNameUsesServiceNameAndTimestamp(t *testing.
 		ObservedAt: time.Date(2026, 5, 24, 19, 12, 44, 0, time.UTC),
 	}
 
-	got := anytypeHistoricalObservationName(observation, "443 HTTPS - api.demo.example")
-	want := "443 HTTPS - api.demo.example @ 2026-05-24T19:12:44Z"
+	got := anytypeHistoricalObservationName(observation, "443 HTTPS - 10.20.30.40")
+	want := "443 HTTPS - 10.20.30.40"
 	if got != want {
 		t.Fatalf("name=%q; want %q", got, want)
 	}
@@ -125,9 +151,97 @@ func TestAnytypeHistoricalObservationNameFallsBackToObservationShape(t *testing.
 	}
 
 	got := anytypeHistoricalObservationName(observation, "")
-	want := "3389 MS-WBT-SERVER - 172.16.10.50 @ 2026-05-24T19:33:42Z"
+	want := "3389 MS-WBT-SERVER - 172.16.10.50"
 	if got != want {
 		t.Fatalf("name=%q; want %q", got, want)
+	}
+}
+
+func TestAnytypeServicePropertiesIncludeAliases(t *testing.T) {
+	properties := anytypeServiceProperties(AnytypeOptions{
+		ServiceAliasPropertyKey: "service_alias",
+		PortPropertyKey:         "port",
+		StatePropertyKey:        "state",
+		ServicePropertyKey:      "service",
+		BannerPropertyKey:       "banner",
+		EngagementPropertyKey:   "engagement",
+		AssetPropertyKey:        "asset",
+	}, "eng-1", "asset-1", []string{"api.example.com", "admin.example.com"}, storage.PortScanRecord{
+		Port:     443,
+		Protocol: "tcp",
+		State:    "open",
+		Service:  "https",
+		Version:  "nginx",
+	})
+
+	if len(properties) != 7 {
+		t.Fatalf("len(properties)=%d; want 7", len(properties))
+	}
+	if got := properties[0]["key"]; got != "service_alias" {
+		t.Fatalf("key=%v; want service_alias", got)
+	}
+	if got := properties[0]["text"]; got != "api.example.com, admin.example.com" {
+		t.Fatalf("alias=%v; want api.example.com, admin.example.com", got)
+	}
+}
+
+func TestNormalizeAnytypeOptionsFallsBackToSharedAliasProperty(t *testing.T) {
+	opts := NormalizeAnytypeOptions(AnytypeOptions{
+		AliasPropertyKey: "alias",
+	})
+
+	if opts.AssetAliasPropertyKey != "alias" {
+		t.Fatalf("asset alias=%q; want alias", opts.AssetAliasPropertyKey)
+	}
+	if opts.ServiceAliasPropertyKey != "alias" {
+		t.Fatalf("service alias=%q; want alias", opts.ServiceAliasPropertyKey)
+	}
+}
+
+func TestBuildAnytypeAssetsIncludesScanIPsWithoutSubdomains(t *testing.T) {
+	scans := []storage.PortScanRecord{
+		testPortScan("203.0.113.20", 443, "tcp", "https"),
+		testPortScan("203.0.113.20", 80, "tcp", "http"),
+		testPortScan("203.0.113.30", 22, "tcp", "ssh"),
+	}
+
+	got := buildAnytypeAssets(nil, scans)
+	if len(got) != 2 {
+		t.Fatalf("assets=%v; want 2", got)
+	}
+	if got[0].IP != "203.0.113.20" || len(got[0].Aliases) != 0 {
+		t.Fatalf("first asset=%v; want 203.0.113.20 with no aliases", got[0])
+	}
+	if got[1].IP != "203.0.113.30" || len(got[1].Aliases) != 0 {
+		t.Fatalf("second asset=%v; want 203.0.113.30 with no aliases", got[1])
+	}
+}
+
+func TestWalkAnytypeSearchPagesAdvancesOffsetsUntilMatch(t *testing.T) {
+	var offsets []int
+	err := walkAnytypeSearchPages(func(offset, limit int) ([]map[string]any, error) {
+		offsets = append(offsets, offset)
+		switch offset {
+		case 0:
+			return []map[string]any{
+				{"name": "first"},
+				{"name": "second"},
+			}, nil
+		case 2:
+			return []map[string]any{
+				{"name": "wanted"},
+			}, nil
+		default:
+			return nil, nil
+		}
+	}, 2, func(candidate map[string]any) (bool, error) {
+		return candidate["name"] == "wanted", nil
+	})
+	if err != nil {
+		t.Fatalf("walkAnytypeSearchPages: %v", err)
+	}
+	if !reflect.DeepEqual(offsets, []int{0, 2}) {
+		t.Fatalf("offsets=%v; want [0 2]", offsets)
 	}
 }
 
@@ -248,6 +362,29 @@ func TestSuspiciousPortscanIPsMarksHostsAtThreshold(t *testing.T) {
 
 	if disabled := suspiciousPortscanIPs(scans, 0); disabled != nil {
 		t.Fatalf("disabled filtering=%v; want nil", disabled)
+	}
+}
+
+func TestNewAnytypeProgressStateCountsExportableWork(t *testing.T) {
+	suspicious := map[string]struct{}{"10.0.0.2": {}}
+	progress := newAnytypeProgressState(AnytypeOptions{
+		OnlyScans: false,
+		Progress:  func(AnytypeProgress) {},
+	}, []storage.PortScanRecord{
+		{IP: "10.0.0.1", Port: 80, Protocol: "tcp", State: "open", Service: "http", Version: "nginx"},
+		{IP: "10.0.0.2", Port: 1, Protocol: "tcp", State: "open", Service: "tcpwrapped", Version: ""},
+	}, []storage.ServiceHistoricalObservationRecord{
+		{HostIP: "10.0.0.1", Port: 80, Protocol: "tcp", ObservedState: "open", ObservedService: "http", ObservedBanner: "Apache"},
+		{HostIP: "10.0.0.2", Port: 1, Protocol: "tcp", ObservedState: "open", ObservedService: "tcpwrapped", ObservedBanner: ""},
+	}, []storage.WebProbeRecord{
+		{URL: "https://app.example.com"},
+	}, []storage.CommandRunRecord{
+		{Command: "nmap -Pn app.example.com"},
+	}, suspicious)
+
+	// engagement lookup + 1 service + 1 historical observation + 1 web app + 1 scan
+	if progress.total != 5 {
+		t.Fatalf("progress.total=%d; want 5", progress.total)
 	}
 }
 

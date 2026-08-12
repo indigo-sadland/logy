@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/indigo-sadland/logy/internal/storage"
@@ -29,6 +30,7 @@ type AnytypeOptions struct {
 	Version             string
 	OnlyScans           bool
 	SuspiciousOpenPorts int
+	Progress            func(AnytypeProgress)
 
 	EngagementTypeKey                   string
 	AssetTypeKey                        string
@@ -38,6 +40,8 @@ type AnytypeOptions struct {
 	ServiceHistoricalObservationTypeKey string
 
 	AliasPropertyKey                                string
+	AssetAliasPropertyKey                           string
+	ServiceAliasPropertyKey                         string
 	EngagementPropertyKey                           string
 	AssetPropertyKey                                string
 	PortPropertyKey                                 string
@@ -97,13 +101,27 @@ type AnytypePreview struct {
 	AnytypeURL                                   string
 }
 
+// AnytypeProgress reports exporter progress across object families.
+type AnytypeProgress struct {
+	Phase     string
+	Completed int
+	Total     int
+}
+
 type anytypeClient struct {
 	baseURL string
 	spaceID string
 	token   string
 	version string
 	client  *http.Client
+	limiter *anytypeRateLimiter
 }
+
+const (
+	anytypeSustainedRatePerSecond = 1
+	anytypeBurstSize              = 60
+	anytypeSearchPageSize         = 100
+)
 
 type anytypeProperty map[string]any
 
@@ -152,11 +170,13 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	client := newAnytypeClient(opts)
 	// Suspicious hosts still keep their Scan and web probe evidence.
 	suspiciousHosts := suspiciousPortscanIPs(scans, opts.SuspiciousOpenPorts)
+	progress := newAnytypeProgressState(opts, scans, observations, webProbes, runs, suspiciousHosts)
 
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
 		return AnytypeResult{}, err
 	}
+	progress.report("engagement")
 
 	createdAssets := 0
 	reusedAssets := 0
@@ -170,11 +190,12 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if existing != nil {
 				assets[i].ID = existing.ID
 				reusedAssets++
-				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
 					return AnytypeResult{}, fmt.Errorf("update Anytype asset %s aliases: %w", assets[i].IP, err)
 				} else if updated {
 					updatedAssets++
 				}
+				progress.report("assets")
 				continue
 			}
 
@@ -186,8 +207,14 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
 			}
+			// Patch the asset once after creation so alias and engagement land the
+			// same way on both new and reused Asset objects.
+			if err := client.setAssetProperties(ctx, assetID, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+				return AnytypeResult{}, fmt.Errorf("update Anytype asset %s properties: %w", assets[i].IP, err)
+			}
 			assets[i].ID = assetID
 			createdAssets++
+			progress.report("assets")
 		}
 	}
 
@@ -216,24 +243,25 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 				continue
 			}
 			serviceKey := anytypeServiceObservationKey(scan.IP, scan.Port, scan.Protocol)
-			serviceName := anytypeServiceObjectName(scan, aliasesByIP[scan.IP])
-			exists, err := client.serviceExists(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
+			serviceName := anytypeServiceObjectName(scan)
+			existing, err := client.findExistingService(ctx, opts.ServiceTypeKey, scan, aliasesByIP[scan.IP], opts.EngagementPropertyKey, engagementID)
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("search Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
 			}
-			if exists {
+			if existing != nil {
 				reusedServices++
-				existing, err := client.findObjectByExactName(ctx, opts.ServiceTypeKey, serviceName)
-				if err == nil && existing != nil {
-					serviceIDByKey[serviceKey] = existing.ID
-					serviceNameByKey[serviceKey] = serviceName
+				if _, err := client.mergeServiceAliases(ctx, existing, opts.ServiceAliasPropertyKey, aliasesByIP[scan.IP]); err != nil {
+					return AnytypeResult{}, fmt.Errorf("update Anytype service %s:%d/%s aliases: %w", scan.IP, scan.Port, scan.Protocol, err)
 				}
+				serviceIDByKey[serviceKey] = existing.ID
+				serviceNameByKey[serviceKey] = serviceName
+				progress.report("services")
 				continue
 			}
 			serviceID, err := client.createObject(ctx, anytypeCreateObjectRequest{
 				TypeKey:    opts.ServiceTypeKey,
 				Name:       serviceName,
-				Properties: anytypeServiceProperties(opts, engagementID, assetID, scan),
+				Properties: anytypeServiceProperties(opts, engagementID, assetID, aliasesByIP[scan.IP], scan),
 			})
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("create Anytype service for %s:%d/%s: %w", scan.IP, scan.Port, scan.Protocol, err)
@@ -243,6 +271,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 				serviceIDByKey[serviceKey] = serviceID
 				serviceNameByKey[serviceKey] = serviceName
 			}
+			progress.report("services")
 		}
 	}
 
@@ -274,6 +303,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if exists {
 				skippedHistorical++
+				progress.report("history")
 				continue
 			}
 			observationID, err := client.createObject(ctx, anytypeCreateObjectRequest{
@@ -287,6 +317,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if observationID != "" {
 				createdHistorical++
 			}
+			progress.report("history")
 		}
 	}
 
@@ -305,6 +336,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if exists {
 				skippedWebApps++
+				progress.report("web-apps")
 				continue
 			}
 			objectID, err := client.createObject(ctx, anytypeCreateObjectRequest{
@@ -318,6 +350,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if objectID != "" {
 				createdWebApps++
 			}
+			progress.report("web-apps")
 		}
 	}
 
@@ -335,9 +368,11 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if !updated {
 				skippedScans++
+				progress.report("scans")
 				continue
 			}
 			skippedScans++
+			progress.report("scans")
 			continue
 		}
 		markdown, err := commandRunMarkdown(run, opts.DatabasePath)
@@ -357,6 +392,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		if scanID != "" {
 			createdScans++
 		}
+		progress.report("scans")
 	}
 
 	return AnytypeResult{
@@ -380,6 +416,66 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 		AnytypeSpace: opts.SpaceID,
 		AnytypeURL:   opts.BaseURL,
 	}, nil
+}
+
+type anytypeProgressState struct {
+	completed int
+	total     int
+	reportFn  func(AnytypeProgress)
+}
+
+// Build one stable total up front so the CLI bar does not jump between phases.
+func newAnytypeProgressState(opts AnytypeOptions, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord, suspiciousHosts map[string]struct{}) *anytypeProgressState {
+	if opts.Progress == nil {
+		return &anytypeProgressState{}
+	}
+
+	total := 1 + len(runs) // engagement lookup + scans
+	if !opts.OnlyScans {
+		total += countExportableServices(scans, suspiciousHosts)
+		total += countExportableHistoricalObservations(observations, scans, suspiciousHosts)
+		total += len(webProbes)
+	}
+	return &anytypeProgressState{total: total, reportFn: opts.Progress}
+}
+
+// Every completed lookup or object sync advances the shared export bar by one step.
+func (p *anytypeProgressState) report(phase string) {
+	if p.reportFn == nil {
+		return
+	}
+	p.completed++
+	p.reportFn(AnytypeProgress{
+		Phase:     phase,
+		Completed: p.completed,
+		Total:     p.total,
+	})
+}
+
+// Services skipped by the suspicious-host filter never reach Anytype, so preview drops them too.
+func countExportableServices(scans []storage.PortScanRecord, suspiciousHosts map[string]struct{}) int {
+	total := 0
+	for _, scan := range scans {
+		if _, ok := suspiciousHosts[strings.TrimSpace(scan.IP)]; ok {
+			continue
+		}
+		total++
+	}
+	return total
+}
+
+// History progress only counts observations that survive filtering and actually differ from the current service row.
+func countExportableHistoricalObservations(observations []storage.ServiceHistoricalObservationRecord, scans []storage.PortScanRecord, suspiciousHosts map[string]struct{}) int {
+	total := 0
+	for _, observation := range observations {
+		if _, ok := suspiciousHosts[strings.TrimSpace(observation.HostIP)]; ok {
+			continue
+		}
+		if collidesWithCurrentService(observation, scans) {
+			total++
+		}
+	}
+	return total
 }
 
 // PreviewAnytype resolves the target engagement and counts the objects that would be created without mutating Anytype.
@@ -472,6 +568,8 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.WebAppObservationTypeKey = strings.TrimSpace(opts.WebAppObservationTypeKey)
 	opts.ServiceHistoricalObservationTypeKey = strings.TrimSpace(opts.ServiceHistoricalObservationTypeKey)
 	opts.AliasPropertyKey = strings.TrimSpace(opts.AliasPropertyKey)
+	opts.AssetAliasPropertyKey = strings.TrimSpace(opts.AssetAliasPropertyKey)
+	opts.ServiceAliasPropertyKey = strings.TrimSpace(opts.ServiceAliasPropertyKey)
 	opts.EngagementPropertyKey = strings.TrimSpace(opts.EngagementPropertyKey)
 	opts.AssetPropertyKey = strings.TrimSpace(opts.AssetPropertyKey)
 	opts.PortPropertyKey = strings.TrimSpace(opts.PortPropertyKey)
@@ -489,6 +587,12 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.HistoricalObservationObservedBannerPropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedBannerPropertyKey)
 	opts.HistoricalObservationObservedServicePropertyKey = strings.TrimSpace(opts.HistoricalObservationObservedServicePropertyKey)
 	opts.HistoricalObservationTimestampPropertyKey = strings.TrimSpace(opts.HistoricalObservationTimestampPropertyKey)
+	if opts.AssetAliasPropertyKey == "" {
+		opts.AssetAliasPropertyKey = opts.AliasPropertyKey
+	}
+	if opts.ServiceAliasPropertyKey == "" {
+		opts.ServiceAliasPropertyKey = opts.AliasPropertyKey
+	}
 	return opts
 }
 
@@ -510,6 +614,8 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
 	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.WebAppObservationTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
+	case opts.AssetAliasPropertyKey == "" || opts.ServiceAliasPropertyKey == "":
+		return fmt.Errorf("Anytype alias property keys must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
 	case opts.WebAppObservationTitlePropertyKey == "" || opts.WebAppObservationStatusCodePropertyKey == "" || opts.WebAppObservationTechnologiesPropertyKey == "":
@@ -533,13 +639,14 @@ func anytypeCommandRunProperties(opts AnytypeOptions, engagementID string, run s
 
 func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []string) []anytypeProperty {
 	return []anytypeProperty{
-		textProperty(opts.AliasPropertyKey, strings.Join(aliases, ", ")),
+		textProperty(opts.AssetAliasPropertyKey, strings.Join(aliases, ", ")),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
 	}
 }
 
-func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, scan storage.PortScanRecord) []anytypeProperty {
+func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, aliases []string, scan storage.PortScanRecord) []anytypeProperty {
 	return []anytypeProperty{
+		textProperty(opts.ServiceAliasPropertyKey, strings.Join(aliases, ", ")),
 		textProperty(opts.PortPropertyKey, anytypePortValue(scan.Port, scan.Protocol)),
 		textProperty(opts.StatePropertyKey, scan.State),
 		textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
@@ -651,6 +758,8 @@ func newAnytypeClient(opts AnytypeOptions) anytypeClient {
 		token:   opts.Token,
 		version: opts.Version,
 		client:  http.DefaultClient,
+		// Match Anytype's documented burst and sustained request limits locally.
+		limiter: newAnytypeRateLimiter(anytypeSustainedRatePerSecond, anytypeBurstSize),
 	}
 }
 
@@ -668,7 +777,7 @@ func anytypeHistoricalObservationName(observation storage.ServiceHistoricalObser
 		// Fall back to the observation itself when no current service name was resolved.
 		serviceName = anytypeServiceObservationFallbackName(observation)
 	}
-	return serviceName + " @ " + observation.ObservedAt.UTC().Format(time.RFC3339)
+	return serviceName
 }
 
 func collidesWithCurrentService(observation storage.ServiceHistoricalObservationRecord, scans []storage.PortScanRecord) bool {
@@ -698,30 +807,21 @@ func collidesWithCurrentService(observation storage.ServiceHistoricalObservation
 }
 
 func anytypeServiceObservationFallbackName(observation storage.ServiceHistoricalObservationRecord) string {
-	target := strings.TrimSpace(observation.Hostname)
-	if target == "" {
-		target = strings.TrimSpace(observation.HostIP)
-	}
-	return fmt.Sprintf("%d %s - %s", observation.Port, formatAnytypeService(observation.ObservedService, observation.Port), target)
+	return fmt.Sprintf("%d %s - %s", observation.Port, formatAnytypeService(observation.ObservedService, observation.Port), strings.TrimSpace(observation.HostIP))
 }
 
-func anytypeServiceObjectName(scan storage.PortScanRecord, aliases []string) string {
-	// Prefer a hostname in the display name when one exists, while still linking
-	// the Service object to the IP Asset.
-	target := scan.IP
-	if len(aliases) > 0 {
-		target = aliases[0]
-	}
-	return fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), target)
+func anytypeServiceObjectName(scan storage.PortScanRecord) string {
+	// Service identity is the asset socket, not one hostname that happens to resolve to it.
+	return fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), strings.TrimSpace(scan.IP))
 }
 
-func anytypeServiceObjectNames(scan storage.PortScanRecord, aliases []string) []string {
-	// Search both the current alias-based name and the IP fallback name so
-	// services exported before hostname discovery are still reused.
-	return uniqueSortedStrings([]string{
-		anytypeServiceObjectName(scan, aliases),
-		anytypeServiceObjectName(scan, nil),
-	})
+func anytypeServiceReuseNames(scan storage.PortScanRecord, aliases []string) []string {
+	// Prefer the current IP-based name, then fall back to older alias-based names during reuse.
+	names := []string{anytypeServiceObjectName(scan)}
+	for _, alias := range aliases {
+		names = append(names, fmt.Sprintf("%d %s - %s", scan.Port, formatAnytypeService(scan.Service, scan.Port), strings.TrimSpace(alias)))
+	}
+	return uniqueStrings(names)
 }
 
 func formatAnytypeService(service string, port int) string {
@@ -761,15 +861,17 @@ func objectsProperty(key string, ids ...string) anytypeProperty {
 }
 
 func (c anytypeClient) findObjectByName(ctx context.Context, typeKey string, name string) (string, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=20", body)
+	var id string
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
+		if strings.EqualFold(anytypeObjectName(candidate), strings.TrimSpace(name)) {
+			id = anytypeString(candidate["id"])
+			return id != "", nil
+		}
+		return false, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("search Anytype engagement %q: %w", name, err)
 	}
-	id := extractAnytypeObjectIDByName(raw, name)
 	if id == "" {
 		return "", fmt.Errorf("Anytype engagement %q was not found\n", name)
 	}
@@ -777,30 +879,27 @@ func (c anytypeClient) findObjectByName(ctx context.Context, typeKey string, nam
 }
 
 func (c anytypeClient) findObjectByExactName(ctx context.Context, typeKey string, name string) (*anytypeObject, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
-	if err != nil {
-		return nil, err
-	}
+	var found *anytypeObject
 	name = strings.TrimSpace(name)
-	for _, candidate := range anytypeResponseObjects(raw) {
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
 		if anytypeObjectName(candidate) != name {
-			continue
+			return false, nil
 		}
 		id := anytypeString(candidate["id"])
 		if id == "" {
-			continue
+			return false, nil
 		}
 		full, err := c.getObject(ctx, id)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
-		return &anytypeObject{ID: id, Raw: full}, nil
+		found = &anytypeObject{ID: id, Raw: full}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return found, nil
 }
 
 func (c anytypeClient) getObject(ctx context.Context, id string) (map[string]any, error) {
@@ -831,68 +930,91 @@ func (c anytypeClient) mergeAssetAliases(ctx context.Context, object *anytypeObj
 	return true, nil
 }
 
-func (c anytypeClient) serviceExists(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (bool, error) {
-	for _, name := range anytypeServiceObjectNames(scan, aliases) {
+func (c anytypeClient) setAssetProperties(ctx context.Context, id string, aliasPropertyKey string, engagementPropertyKey string, engagementID string, aliases []string) error {
+	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
+		Properties: anytypeAssetProperties(AnytypeOptions{
+			AssetAliasPropertyKey: aliasPropertyKey,
+			EngagementPropertyKey: engagementPropertyKey,
+		}, engagementID, aliases),
+	})
+	return err
+}
+
+func (c anytypeClient) mergeServiceAliases(ctx context.Context, object *anytypeObject, aliasPropertyKey string, aliases []string) (bool, error) {
+	existingAliases := splitAliasText(anytypePropertyString(object.Raw, aliasPropertyKey))
+	mergedAliases := mergeAliasValues(existingAliases, aliases)
+	if slices.Equal(existingAliases, mergedAliases) {
+		return false, nil
+	}
+	_, err := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
+		Properties: []anytypeProperty{
+			textProperty(aliasPropertyKey, strings.Join(mergedAliases, ", ")),
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c anytypeClient) findExistingService(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (*anytypeObject, error) {
+	for _, name := range anytypeServiceReuseNames(scan, aliases) {
 		existing, err := c.findObjectByExactName(ctx, typeKey, name)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if existing == nil {
 			continue
 		}
 		if objectLinkedToEngagement(existing.Raw, engagementPropertyKey, engagementID) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, command string, startedAt string, timestampPropertyKey string) (*anytypeObject, error) {
-	body := map[string]any{
-		"query": command,
-		"types": []string{typeKey},
-	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
-	if err != nil {
-		return nil, err
-	}
-	command = strings.TrimSpace(command)
-	for _, candidate := range anytypeResponseObjects(raw) {
-		if anytypeString(candidate["name"]) != command {
-			continue
-		}
-		timestamp := anytypePropertyString(candidate, timestampPropertyKey)
-		if timestamp == "" || timestamp == startedAt {
-			id := anytypeString(candidate["id"])
-			if id == "" {
-				continue
-			}
-			return &anytypeObject{ID: id, Raw: candidate}, nil
+			return existing, nil
 		}
 	}
 	return nil, nil
 }
 
-func (c anytypeClient) historicalObservationExists(ctx context.Context, typeKey string, name string, observedAt time.Time, timestampPropertyKey string) (bool, error) {
-	body := map[string]any{
-		"query": name,
-		"types": []string{typeKey},
+func (c anytypeClient) findExistingScan(ctx context.Context, typeKey string, command string, startedAt string, timestampPropertyKey string) (*anytypeObject, error) {
+	var found *anytypeObject
+	command = strings.TrimSpace(command)
+	err := c.walkSearchResults(ctx, typeKey, command, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
+		if anytypeString(candidate["name"]) != command {
+			return false, nil
+		}
+		timestamp := anytypePropertyString(candidate, timestampPropertyKey)
+		if timestamp == "" || timestamp == startedAt {
+			id := anytypeString(candidate["id"])
+			if id == "" {
+				return false, nil
+			}
+			found = &anytypeObject{ID: id, Raw: candidate}
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	raw, err := c.doJSON(ctx, http.MethodPost, "/v1/spaces/"+c.spaceID+"/search?offset=0&limit=100", body)
+	return found, nil
+}
+
+func (c anytypeClient) historicalObservationExists(ctx context.Context, typeKey string, name string, observedAt time.Time, timestampPropertyKey string) (bool, error) {
+	wantName := strings.TrimSpace(name)
+	wantTimestamp := observedAt.UTC().Format(time.RFC3339)
+	found := false
+	err := c.walkSearchResults(ctx, typeKey, name, anytypeSearchPageSize, func(candidate map[string]any) (bool, error) {
+		if anytypeString(candidate["name"]) != wantName {
+			return false, nil
+		}
+		if anytypePropertyString(candidate, timestampPropertyKey) == wantTimestamp {
+			found = true
+			return true, nil
+		}
+		return false, nil
+	})
 	if err != nil {
 		return false, err
 	}
-	wantName := strings.TrimSpace(name)
-	wantTimestamp := observedAt.UTC().Format(time.RFC3339)
-	for _, candidate := range anytypeResponseObjects(raw) {
-		if anytypeString(candidate["name"]) != wantName {
-			continue
-		}
-		if anytypePropertyString(candidate, timestampPropertyKey) == wantTimestamp {
-			return true, nil
-		}
-	}
-	return false, nil
+	return found, nil
 }
 
 func (c anytypeClient) webAppObservationExists(ctx context.Context, typeKey string, name string) (bool, error) {
@@ -944,45 +1066,194 @@ func (c anytypeClient) updateObject(ctx context.Context, id string, payload anyt
 }
 
 func (c anytypeClient) doJSON(ctx context.Context, method string, path string, payload any) (map[string]any, error) {
-	var body io.Reader
+	var rawPayload []byte
 	if payload != nil {
-		rawPayload, err := json.Marshal(payload)
+		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return nil, err
 		}
-		body = bytes.NewReader(rawPayload)
+		rawPayload = encoded
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Anytype-Version", c.version)
-	req.Header.Set("Content-Type", "application/json")
+	for attempt := 0; attempt < 3; attempt++ {
+		// Respect Anytype's local burst limiter before sending the next request.
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		var body io.Reader
+		if rawPayload != nil {
+			body = bytes.NewReader(rawPayload)
+		}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Anytype-Version", c.version)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < 2 {
+			// A short backoff lets the local Anytype limiter refill before retrying.
+			if err := waitForAnytypeRateLimitRecovery(ctx); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return nil, fmt.Errorf("Anytype API returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		}
+
+		var out map[string]any
+		if len(bytes.TrimSpace(raw)) == 0 {
+			return map[string]any{}, nil
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("decode Anytype response: %w", err)
+		}
+		return out, nil
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("Anytype API returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	return nil, fmt.Errorf("Anytype API rate limit retries exhausted")
+}
+
+type anytypeRateLimiter struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+	rate   float64
+	burst  float64
+}
+
+// Use a small token bucket so large exports can burst briefly without outrunning Anytype.
+func newAnytypeRateLimiter(ratePerSecond float64, burst int) *anytypeRateLimiter {
+	return &anytypeRateLimiter{
+		tokens: float64(burst),
+		last:   time.Now(),
+		rate:   ratePerSecond,
+		burst:  float64(burst),
+	}
+}
+
+// Wait blocks until one request slot is available or the caller cancels the export.
+func (l *anytypeRateLimiter) Wait(ctx context.Context) error {
+	for {
+		waitFor := l.reserve()
+		if waitFor <= 0 {
+			return nil
+		}
+
+		timer := time.NewTimer(waitFor)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// reserve refills elapsed tokens and returns how long the next request must wait.
+func (l *anytypeRateLimiter) reserve() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(l.last).Seconds()
+	if elapsed > 0 {
+		l.tokens += elapsed * l.rate
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		l.last = now
 	}
 
-	var out map[string]any
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return map[string]any{}, nil
+	if l.tokens >= 1 {
+		l.tokens--
+		return 0
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode Anytype response: %w", err)
+
+	missing := 1 - l.tokens
+	waitSeconds := missing / l.rate
+	if waitSeconds <= 0 {
+		return 0
 	}
-	return out, nil
+	return time.Duration(waitSeconds * float64(time.Second))
+}
+
+// Give Anytype a brief cool-down after a 429 before retrying the same request.
+func waitForAnytypeRateLimitRecovery(ctx context.Context) error {
+	timer := time.NewTimer(time.Second)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// walkSearchResults pages through Anytype search results until the visitor finds a match or results are exhausted.
+func (c anytypeClient) walkSearchResults(ctx context.Context, typeKey string, query string, pageSize int, visit func(map[string]any) (bool, error)) error {
+	if pageSize <= 0 {
+		pageSize = anytypeSearchPageSize
+	}
+	return walkAnytypeSearchPages(func(offset, limit int) ([]map[string]any, error) {
+		body := map[string]any{
+			"query": query,
+			"types": []string{typeKey},
+		}
+		raw, err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/v1/spaces/%s/search?offset=%d&limit=%d", c.spaceID, offset, limit), body)
+		if err != nil {
+			return nil, err
+		}
+		return anytypeResponseObjects(raw), nil
+	}, pageSize, visit)
+}
+
+// walkAnytypeSearchPages keeps advancing offset while each page is full-sized.
+func walkAnytypeSearchPages(fetch func(offset, limit int) ([]map[string]any, error), pageSize int, visit func(map[string]any) (bool, error)) error {
+	if pageSize <= 0 {
+		pageSize = anytypeSearchPageSize
+	}
+	for offset := 0; ; offset += pageSize {
+		candidates, err := fetch(offset, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		for _, candidate := range candidates {
+			stop, err := visit(candidate)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		if len(candidates) < pageSize {
+			return nil
+		}
+	}
 }
 
 func extractAnytypeObjectIDByName(raw map[string]any, wantName string) string {
@@ -1218,6 +1489,24 @@ func uniqueSortedStrings(values []string) []string {
 		out = append(out, value)
 	}
 	slices.Sort(out)
+	return out
+}
+
+// Preserve candidate order so canonical names stay ahead of legacy fallbacks.
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
 	return out
 }
 

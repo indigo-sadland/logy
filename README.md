@@ -41,6 +41,8 @@ cd logy && go build -o logy main.go
   - `gotator`
 - Required for port scanning:
   - `nmap`
+- Required for web probing:
+  - `httpx` (_from projectdiscovery_)
 - Required for terminal output recording:
   - `script`
 

@@ -12,6 +12,7 @@ import (
 	"github.com/indigo-sadland/logy/internal/modules/exporter"
 	"github.com/indigo-sadland/logy/internal/storage"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -61,7 +62,9 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.WebAppObservationTypeKey, "web-app-observation-type", "web_app_observation", "Anytype type key for Web app observation objects")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceHistoricalObservationTypeKey, "service-historical-observation-type", "historical_observation", "Anytype type key for Service historical observation objects")
 
-	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "Anytype property key for Asset aliases")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "deprecated shared Anytype alias property key fallback")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetAliasPropertyKey, "asset-alias-property", "alias", "Anytype property key for Asset aliases")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceAliasPropertyKey, "service-alias-property", "alias", "Anytype property key for Service aliases")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementPropertyKey, "engagement-property", "engagement", "Anytype property key for Engagement object links")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetPropertyKey, "asset-property", "asset", "Anytype property key for Asset object links")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.PortPropertyKey, "port-property", "port", "Anytype property key for Service port")
@@ -93,6 +96,8 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"web-app-observation-type",
 		"service-historical-observation-type",
 		"alias-property",
+		"asset-alias-property",
+		"service-alias-property",
 		"engagement-property",
 		"asset-property",
 		"port-property",
@@ -151,62 +156,12 @@ func runExportAnytype(cmd *cobra.Command) error {
 	}
 	defer store.Close()
 
-	var subdomains []storage.SubdomainRecord
-	if !opts.OnlyScans {
-		subdomains, err = store.SubdomainsByDomain(opts.Domain)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("no subdomain results for domain %s\n", opts.Domain)
-			}
-			return err
-		}
+	data, err := loadAnytypeExportData(store, opts)
+	if err != nil {
+		return err
 	}
 
-	scans, err := store.PortScansByDomain(opts.Domain)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			scans = nil
-		} else {
-			return err
-		}
-	}
-
-	runs, err := store.CommandRunsByDomain(opts.Domain)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			if opts.OnlyScans {
-				return fmt.Errorf("no command run results for domain %s\n", opts.Domain)
-			}
-			runs = nil
-		} else {
-			return err
-		}
-	}
-	// Historical observations are optional; older domains may not have any yet.
-	var observations []storage.ServiceHistoricalObservationRecord
-	if !opts.OnlyScans {
-		observations, err = store.ServiceHistoricalObservationsByDomain(opts.Domain)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				observations = nil
-			} else {
-				return err
-			}
-		}
-	}
-	// Web probe history exports independently from the service graph.
-	var webProbes []storage.WebProbeRecord
-	if !opts.OnlyScans {
-		webProbes, err = store.WebProbesByDomain(opts.Domain)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				webProbes = nil
-			} else {
-				return err
-			}
-		}
-	}
-	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
+	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.observations, data.webProbes, data.runs)
 	if err != nil {
 		return err
 	}
@@ -216,8 +171,14 @@ func runExportAnytype(cmd *cobra.Command) error {
 		}
 	}
 
+	progress := newAnytypeProgressBar()
+	defer progress.finish()
+	if progress.enabled {
+		opts.Progress = progress.report
+	}
+
 	// Export uses the same preview inputs so suspicious-host counts stay aligned.
-	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, subdomains, scans, observations, webProbes, runs)
+	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.observations, data.webProbes, data.runs)
 	if err != nil {
 		return err
 	}
@@ -271,6 +232,72 @@ func runExportAnytype(cmd *cobra.Command) error {
 	return enc.Encode(summary)
 }
 
+type anytypeExportData struct {
+	subdomains   []storage.SubdomainRecord
+	scans        []storage.PortScanRecord
+	observations []storage.ServiceHistoricalObservationRecord
+	webProbes    []storage.WebProbeRecord
+	runs         []storage.CommandRunRecord
+}
+
+func loadAnytypeExportData(store *storage.Store, opts anytypeExportOptions) (anytypeExportData, error) {
+	var data anytypeExportData
+	var err error
+
+	if !opts.OnlyScans {
+		data.subdomains, err = store.SubdomainsByDomain(opts.Domain)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return anytypeExportData{}, err
+			}
+			data.subdomains = nil
+		}
+	}
+
+	data.scans, err = store.PortScansByDomain(opts.Domain)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return anytypeExportData{}, err
+		}
+		data.scans = nil
+	}
+
+	data.runs, err = store.CommandRunsByDomain(opts.Domain)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return anytypeExportData{}, err
+		}
+		if opts.OnlyScans {
+			return anytypeExportData{}, fmt.Errorf("no command run results for domain %s\n", opts.Domain)
+		}
+		data.runs = nil
+	}
+
+	// Historical observations are optional; older domains may not have any yet.
+	if !opts.OnlyScans {
+		data.observations, err = store.ServiceHistoricalObservationsByDomain(opts.Domain)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return anytypeExportData{}, err
+			}
+			data.observations = nil
+		}
+	}
+
+	// Web probe history exports independently from the service graph.
+	if !opts.OnlyScans {
+		data.webProbes, err = store.WebProbesByDomain(opts.Domain)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return anytypeExportData{}, err
+			}
+			data.webProbes = nil
+		}
+	}
+
+	return data, nil
+}
+
 func normalizeAnytypeExportOptions(opts anytypeExportOptions) anytypeExportOptions {
 	opts.AnytypeOptions = exporter.NormalizeAnytypeOptions(opts.AnytypeOptions)
 	opts.ConfigPath = strings.TrimSpace(opts.ConfigPath)
@@ -308,4 +335,51 @@ func envOrDefault(key string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+type anytypeProgressBar struct {
+	enabled bool
+	lastLen int
+}
+
+// Render live progress only in interactive terminals so JSON output stays clean.
+func newAnytypeProgressBar() *anytypeProgressBar {
+	return &anytypeProgressBar{
+		enabled: isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd()),
+	}
+}
+
+// Rewrite one stderr line in place as each exporter step completes.
+func (p *anytypeProgressBar) report(progress exporter.AnytypeProgress) {
+	if !p.enabled {
+		return
+	}
+
+	total := progress.Total
+	if total <= 0 {
+		total = 1
+	}
+	completed := progress.Completed
+	if completed > total {
+		completed = total
+	}
+
+	const width = 24
+	filled := completed * width / total
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+	line := fmt.Sprintf("\r[*] anytype export: [%s] %d/%d phase=%s", bar, completed, total, progress.Phase)
+	if pad := p.lastLen - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	fmt.Fprint(os.Stderr, line)
+	p.lastLen = len(line)
+}
+
+// Finish the in-place line so later stderr or shell output starts cleanly.
+func (p *anytypeProgressBar) finish() {
+	if !p.enabled || p.lastLen == 0 {
+		return
+	}
+	fmt.Fprint(os.Stderr, "\n")
+	p.lastLen = 0
 }
