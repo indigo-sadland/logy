@@ -84,9 +84,7 @@ func (c *Config) applyDefaults() {
 	if c.Resolver.Workers <= 0 {
 		c.Resolver.Workers = 100
 	}
-	if c.Resolver.Binary == "" {
-		c.Resolver.Binary = "dnsx"
-	}
+	c.Resolver.Binary = strings.TrimSpace(c.Resolver.Binary)
 	c.Resolver.ResolversFile = strings.TrimSpace(c.Resolver.ResolversFile)
 	if c.Resolver.Timeout == "" {
 		c.Resolver.Timeout = "4s"
@@ -132,9 +130,6 @@ func (c Config) Validate() error {
 	}
 	if c.Resolver.Workers <= 0 {
 		return fmt.Errorf("config.resolver.workers must be > 0")
-	}
-	if c.Resolver.Binary == "" {
-		return fmt.Errorf("config.resolver.binary is required")
 	}
 	if c.Resolver.ResolversFile != "" {
 		if err := validateExistingFile(c.Resolver.ResolversFile); err != nil {

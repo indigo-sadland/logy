@@ -2,14 +2,20 @@ package cmd
 
 import (
 	"encoding/json"
-	"github.com/indigo-sadland/logy/internal/modules/discovery"
-	"github.com/indigo-sadland/logy/internal/modules/resolver"
-	"github.com/indigo-sadland/logy/internal/storage"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
+	"codeberg.org/miekg/dns/rdata"
+	"github.com/indigo-sadland/logy/internal/modules/discovery"
+	"github.com/indigo-sadland/logy/internal/modules/resolver"
+	"github.com/indigo-sadland/logy/internal/storage"
 
 	"github.com/spf13/cobra"
 )
@@ -136,35 +142,14 @@ func TestRunDomainImportAutoResolvesPlainHosts(t *testing.T) {
 	dbPath := filepath.Join(dir, "recon.db")
 	importPath := filepath.Join(dir, "targets.txt")
 	resolversPath := filepath.Join(dir, "resolvers.txt")
-	dnsxPath := filepath.Join(dir, "fake-dnsx.sh")
 	configPath := filepath.Join(dir, "config.yaml")
+	server := startDomainImportDNSServer(t)
 
 	if err := os.WriteFile(importPath, []byte("api.example.com\ncdn.example.com,2.2.2.2\n"), 0o644); err != nil {
 		t.Fatalf("write import file: %v", err)
 	}
-	if err := os.WriteFile(resolversPath, []byte("1.1.1.1\n"), 0o644); err != nil {
+	if err := os.WriteFile(resolversPath, []byte(server+"\n"), 0o644); err != nil {
 		t.Fatalf("write resolvers file: %v", err)
-	}
-	script := `#!/bin/sh
-input=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-l" ]; then
-    input="$2"
-    shift 2
-    continue
-  fi
-  shift
-done
-while IFS= read -r host; do
-  case "$host" in
-    api.example.com)
-      printf '%s\n' '{"host":"api.example.com","a":["1.1.1.1"]}'
-      ;;
-  esac
-done < "$input"
-`
-	if err := os.WriteFile(dnsxPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake dnsx: %v", err)
 	}
 	configYAML := `
 database:
@@ -173,7 +158,6 @@ discovery:
   tools:
     - subfinder
 resolver:
-  binary: ` + dnsxPath + `
   workers: 10
   timeout: 4s
   resolvers_file: ` + resolversPath + `
@@ -248,4 +232,47 @@ resolver:
 	if summary.AutoResolved != 1 || summary.Resolved != 2 || summary.Unresolved != 0 {
 		t.Fatalf("summary=%+v; want auto_resolved=1 resolved=2 unresolved=0", summary)
 	}
+}
+
+func startDomainImportDNSServer(t *testing.T) string {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+
+			req := new(dns.Msg)
+			req.Data = append(req.Data[:0], buf[:n]...)
+			if err := req.Unpack(); err != nil {
+				continue
+			}
+
+			resp := dnsutil.SetReply(new(dns.Msg), req)
+			name, qtype := dnsutil.Question(req)
+			if name == "api.example.com." && qtype == dns.TypeA {
+				resp.Answer = append(resp.Answer, &dns.A{
+					Hdr: dns.Header{Name: name, Class: dns.ClassINET, TTL: 60},
+					A:   rdata.A{Addr: netip.MustParseAddr("1.1.1.1")},
+				})
+			}
+			if err := resp.Pack(); err != nil {
+				continue
+			}
+			_, _ = conn.WriteTo(resp.Data, addr)
+		}
+	}()
+
+	return conn.LocalAddr().String()
 }

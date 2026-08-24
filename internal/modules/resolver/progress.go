@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-type dnsxProgressTracker struct {
-	binary    string
+type progressTracker struct {
+	name      string
 	hostCount int
 	startedAt time.Time
 	stopCh    chan struct{}
@@ -17,16 +17,16 @@ type dnsxProgressTracker struct {
 	resolved  atomic.Int64
 }
 
-func newDNSXProgressTracker(binary string, hostCount int) *dnsxProgressTracker {
-	return &dnsxProgressTracker{
-		binary:    filepath.Base(binary),
+func newProgressTracker(name string, hostCount int) *progressTracker {
+	return &progressTracker{
+		name:      filepath.Base(name),
 		hostCount: hostCount,
 		startedAt: time.Now(),
 		stopCh:    make(chan struct{}),
 	}
 }
 
-func (t *dnsxProgressTracker) start() {
+func (t *progressTracker) start() {
 	if !shouldRenderResolverProgress() {
 		return
 	}
@@ -46,31 +46,31 @@ func (t *dnsxProgressTracker) start() {
 	}()
 }
 
-func (t *dnsxProgressTracker) incrementResolved() {
+func (t *progressTracker) incrementResolved() {
 	t.resolved.Add(1)
 }
 
-func (t *dnsxProgressTracker) render() {
+func (t *progressTracker) render() {
 	if !shouldRenderResolverProgress() {
 		return
 	}
 	_, _ = fmt.Fprint(os.Stdout, t.renderLine())
 }
 
-func (t *dnsxProgressTracker) renderLine() string {
+func (t *progressTracker) renderLine() string {
 	frames := []string{"|", "/", "-", "\\"}
 	elapsed := time.Since(t.startedAt).Round(time.Second)
 	frame := frames[int(time.Since(t.startedAt)/(200*time.Millisecond))%len(frames)]
-	return fmt.Sprintf("\r[*] resolver/%s %s elapsed=%s hosts=%d resolved_lines=%d",
-		t.binary,
+	return fmt.Sprintf("\r[*] resolver/%s %s elapsed=%s hosts=%d completed=%d",
+		t.name,
 		frame,
 		elapsed,
 		t.hostCount,
 		t.resolved.Load(),
-	) // 'resolved_lines' is how many result lines dnsx has emitted so far, not full  host completion across resolved and unresolved names
+	)
 }
 
-func (t *dnsxProgressTracker) finish() {
+func (t *progressTracker) finish() {
 	if !shouldRenderResolverProgress() {
 		return
 	}

@@ -27,8 +27,6 @@ cd logy && go build -o logy main.go
 ## Required Tools
 `logy` relies on external tools. The following binaries must be installed and available in `PATH` for the commands you use:
 
-- Always required for normal discovery and resolution:
-  - `dnsx`
 - Required when the matching discovery provider is enabled:
   - `subfinder`
   - `amass`
@@ -46,4 +44,5 @@ cd logy && go build -o logy main.go
 - Required for terminal output recording:
   - `script`
 
+> [!NOTE]
 > Also, if you want to experience export to **Anytype** you need to install it as well!

@@ -30,7 +30,8 @@ discovery:
       enabled: true
 
 resolver:
-  binary: dnsx
+  # binary is deprecated; resolution uses in-process miekg/dns.
+  binary:
   workers: 100
   timeout: 4s
   resolvers_file: "/path/to/resolvers/file"

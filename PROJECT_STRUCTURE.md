@@ -64,8 +64,8 @@
 - `internal/modules/exporter/`
   - `anytype.go` - Anytype API client and push workflow for Assets, Services, service historical observations, web app observations, and Scans
 - `internal/modules/resolver/` - DNS and vhost resolution adapters
-  - `resolver.go` - `dnsx` wrapper, live progress handling, and JSONL response parsing
-  - `progress.go` - terminal progress tracker for long-running `dnsx` resolution
+  - `resolver.go` - in-process `miekg/dns` A/AAAA resolver, resolver-file handling, and answer normalization
+  - `progress.go` - terminal progress tracker for long-running DNS resolution
   - `vhostfinder.go` - `VhostFinder` wrapper and output parsing
 - `internal/modules/permutation/`
   - `gotator.go` - `gotator` wrapper for generating candidate subdomain permutations that are later confirmed through DNS or vhost resolution

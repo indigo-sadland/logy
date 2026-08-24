@@ -233,7 +233,7 @@ var resolvePermuteCmd = &cobra.Command{
 			StoredCandidates int    `json:"stored_candidates"`
 			Resolved         int    `json:"resolved"`
 			Unresolved       int    `json:"unresolved"`
-			ResolverBinary   string `json:"resolver_binary"`
+			Resolver         string `json:"resolver"`
 			PermutationTool  string `json:"permutation_tool"`
 			PermutationsFile string `json:"permutations_file"`
 			Database         string `json:"database"`
@@ -245,7 +245,7 @@ var resolvePermuteCmd = &cobra.Command{
 			StoredCandidates: len(unresolvedEntries),
 			Resolved:         len(resolvedResults),
 			Unresolved:       len(unresolvedEntries),
-			ResolverBinary:   cfg.Resolver.Binary,
+			Resolver:         "miekg-dns",
 			PermutationTool:  normalizePermutationBinary(resolvePermutationBinary),
 			PermutationsFile: resolvePermutationsFile,
 			Database:         cfg.Database.Path,
