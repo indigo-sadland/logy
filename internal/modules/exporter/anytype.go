@@ -268,6 +268,9 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			}
 			if serviceID != "" {
 				createdServices++
+				if _, err := client.setServiceAliases(ctx, serviceID, opts.ServiceAliasPropertyKey, aliasesByIP[scan.IP]); err != nil {
+					return AnytypeResult{}, fmt.Errorf("update Anytype service %s:%d/%s aliases: %w", scan.IP, scan.Port, scan.Protocol, err)
+				}
 				serviceIDByKey[serviceKey] = serviceID
 				serviceNameByKey[serviceKey] = serviceName
 			}
@@ -591,7 +594,7 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 		opts.AssetAliasPropertyKey = opts.AliasPropertyKey
 	}
 	if opts.ServiceAliasPropertyKey == "" {
-		opts.ServiceAliasPropertyKey = opts.AliasPropertyKey
+		opts.ServiceAliasPropertyKey = "hostnames,alias"
 	}
 	return opts
 }
@@ -614,8 +617,8 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
 	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.WebAppObservationTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
-	case opts.AssetAliasPropertyKey == "" || opts.ServiceAliasPropertyKey == "":
-		return fmt.Errorf("Anytype alias property keys must not be empty\n")
+	case opts.AssetAliasPropertyKey == "":
+		return fmt.Errorf("Anytype asset alias property key must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
 	case opts.WebAppObservationTitlePropertyKey == "" || opts.WebAppObservationStatusCodePropertyKey == "" || opts.WebAppObservationTechnologiesPropertyKey == "":
@@ -646,7 +649,6 @@ func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []
 
 func anytypeServiceProperties(opts AnytypeOptions, engagementID string, assetID string, aliases []string, scan storage.PortScanRecord) []anytypeProperty {
 	return []anytypeProperty{
-		textProperty(opts.ServiceAliasPropertyKey, strings.Join(aliases, ", ")),
 		textProperty(opts.PortPropertyKey, anytypePortValue(scan.Port, scan.Protocol)),
 		textProperty(opts.StatePropertyKey, scan.State),
 		textProperty(opts.ServicePropertyKey, formatAnytypeService(scan.Service, scan.Port)),
@@ -940,21 +942,65 @@ func (c anytypeClient) setAssetProperties(ctx context.Context, id string, aliasP
 	return err
 }
 
-func (c anytypeClient) mergeServiceAliases(ctx context.Context, object *anytypeObject, aliasPropertyKey string, aliases []string) (bool, error) {
-	existingAliases := splitAliasText(anytypePropertyString(object.Raw, aliasPropertyKey))
-	mergedAliases := mergeAliasValues(existingAliases, aliases)
-	if slices.Equal(existingAliases, mergedAliases) {
+func (c anytypeClient) setServiceAliases(ctx context.Context, id string, aliasPropertyKeys string, aliases []string) (bool, error) {
+	if strings.TrimSpace(aliasPropertyKeys) == "" || len(aliases) == 0 {
 		return false, nil
 	}
-	_, err := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
+
+	updated := false
+	for _, key := range serviceAliasPropertyKeys(aliasPropertyKeys) {
+		err := c.patchServiceAlias(ctx, id, key, aliases)
+		if err != nil {
+			if isAnytypeUnknownPropertyKeyError(err) {
+				continue
+			}
+			return updated, err
+		}
+		updated = true
+	}
+	return updated, nil
+}
+
+func (c anytypeClient) mergeServiceAliases(ctx context.Context, object *anytypeObject, aliasPropertyKeys string, aliases []string) (bool, error) {
+	if strings.TrimSpace(aliasPropertyKeys) == "" || len(aliases) == 0 {
+		return false, nil
+	}
+
+	updated := false
+	for _, key := range serviceAliasPropertyKeys(aliasPropertyKeys) {
+		existingAliases := splitAliasText(anytypePropertyString(object.Raw, key))
+		mergedAliases := mergeAliasValues(existingAliases, aliases)
+		if slices.Equal(existingAliases, mergedAliases) {
+			continue
+		}
+		err := c.patchServiceAlias(ctx, object.ID, key, mergedAliases)
+		if err != nil {
+			if isAnytypeUnknownPropertyKeyError(err) {
+				continue
+			}
+			return updated, err
+		}
+		updated = true
+	}
+	return updated, nil
+}
+
+func (c anytypeClient) patchServiceAlias(ctx context.Context, id string, aliasPropertyKey string, aliases []string) error {
+	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
 		Properties: []anytypeProperty{
-			textProperty(aliasPropertyKey, strings.Join(mergedAliases, ", ")),
+			textProperty(aliasPropertyKey, strings.Join(aliases, ", ")),
 		},
 	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return err
+}
+
+func serviceAliasPropertyKeys(value string) []string {
+	parts := strings.Split(value, ",")
+	return uniqueStrings(parts)
+}
+
+func isAnytypeUnknownPropertyKeyError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unknown property key")
 }
 
 func (c anytypeClient) findExistingService(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (*anytypeObject, error) {

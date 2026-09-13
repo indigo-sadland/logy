@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/indigo-sadland/logy/internal/config"
-	"github.com/indigo-sadland/logy/internal/modules/portscan"
-	"github.com/indigo-sadland/logy/internal/storage"
 	"io"
 	"net"
 	"os"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/indigo-sadland/logy/internal/config"
+	"github.com/indigo-sadland/logy/internal/modules/discovery"
+	"github.com/indigo-sadland/logy/internal/modules/portscan"
+	"github.com/indigo-sadland/logy/internal/modules/resolver"
+	"github.com/indigo-sadland/logy/internal/storage"
 
 	"github.com/spf13/cobra"
 )
@@ -25,6 +29,9 @@ var portscanShowFormat string
 var portscanPickDomain string
 var portscanTargetDomain string
 var portscanTargetLabel string
+var portscanImportDomain string
+var portscanImportFile string
+var portscanImportIncludeNonOpen bool
 
 var portscanCmd = &cobra.Command{
 	Use:     "portscan [--from-db domain] -- [nmap args]",
@@ -112,10 +119,19 @@ var portscanPickCmd = &cobra.Command{
 	},
 }
 
+var portscanImportCmd = &cobra.Command{
+	Use:   "import --domain example.com --file scan.xml",
+	Short: "Import saved nmap XML port scan results",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runPortscanImport(cmd)
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(portscanCmd)
 	portscanCmd.AddCommand(portscanShowCmd)
 	portscanCmd.AddCommand(portscanPickCmd)
+	portscanCmd.AddCommand(portscanImportCmd)
 
 	portscanCmd.Flags().BoolVar(&portscanFromDB, "from-db", false, "scan unique resolved targets from the database")
 	portscanCmd.Flags().StringVarP(&portscanTargetDomain, "domain", "d", "", "target domain to load saved scan targets from")
@@ -129,6 +145,189 @@ func init() {
 	portscanPickCmd.Flags().StringVarP(&portscanPickDomain, "domain", "d", "", "target domain to load saved scan candidates from")
 	portscanPickCmd.Flags().BoolVar(&portscanSaveTempFile, "save-temp-file", false, "persist captured nmap XML output to a temporary file. Use for debug purposes and if run scans with -sC flags")
 	portscanPickCmd.Flags().String("config", defaultConfigPath(), "path to config yaml")
+	portscanImportCmd.Flags().StringVarP(&portscanImportDomain, "domain", "d", "", "target root domain for imported results")
+	portscanImportCmd.Flags().StringVarP(&portscanImportFile, "file", "f", "", "path to nmap XML output")
+	portscanImportCmd.Flags().BoolVar(&portscanImportIncludeNonOpen, "include-non-open", false, "import closed and filtered ports in addition to open ports")
+	portscanImportCmd.Flags().String("config", defaultConfigPath(), "path to config yaml")
+}
+
+func runPortscanImport(cmd *cobra.Command) error {
+	domain, err := requireDomainLabel(portscanImportDomain)
+	if err != nil {
+		return err
+	}
+	path := strings.TrimSpace(portscanImportFile)
+	if path == "" {
+		return fmt.Errorf("--file is required\n")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory\n", path)
+	}
+
+	configPath, _ := cmd.Flags().GetString("config")
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read nmap xml %s: %w", path, err)
+	}
+	imported, err := portscan.ParseNmapXMLImport(raw, portscan.ImportOptions{
+		IncludeNonOpen: portscanImportIncludeNonOpen,
+	})
+	if err != nil {
+		return err
+	}
+
+	store, err := storage.Open(cfg.Database.Path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	// Imported XML uses the same current-service table as live nmap scans.
+	records := make([]storage.PortScanRecord, 0, len(imported.Results))
+	for _, result := range imported.Results {
+		records = append(records, storage.PortScanRecord{
+			Domain:    domain,
+			IP:        result.IP,
+			Port:      result.Port,
+			Protocol:  result.Protocol,
+			State:     result.State,
+			Service:   result.Service,
+			Version:   result.Version,
+			ScannedAt: result.ScannedAt,
+		})
+	}
+	if err := store.SavePortScans(domain, records); err != nil {
+		return err
+	}
+
+	hostnamesSaved, err := saveImportedNmapHostnames(store, domain, imported.Hostnames)
+	if err != nil {
+		return err
+	}
+
+	// Track the import as a completed Scan so Anytype export can show the evidence source.
+	startedAt := imported.ScannedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	finishedAt := time.Now().UTC()
+	command := "nmap xml import: " + path
+	runID, err := store.CreateCommandRun(storage.CommandRunRecord{
+		Domain:    domain,
+		Target:    path,
+		Tool:      "nmap",
+		Command:   command,
+		Status:    "running",
+		StartedAt: startedAt,
+	})
+	if err != nil {
+		return err
+	}
+	if err := store.FinishCommandRun(runID, "completed", 0, finishedAt, "", sql.NullInt64{}, ""); err != nil {
+		return err
+	}
+
+	summary := struct {
+		Domain         string `json:"domain"`
+		File           string `json:"file"`
+		Database       string `json:"database"`
+		HostsSeen      int    `json:"hosts_seen"`
+		HostnamesSaved int    `json:"hostnames_saved"`
+		PortsImported  int    `json:"ports_imported"`
+		PortsSkipped   int    `json:"ports_skipped"`
+		CommandRunID   int64  `json:"command_run_id"`
+	}{
+		Domain:         domain,
+		File:           path,
+		Database:       cfg.Database.Path,
+		HostsSeen:      imported.HostsSeen,
+		HostnamesSaved: hostnamesSaved,
+		PortsImported:  len(records),
+		PortsSkipped:   imported.PortsSkipped,
+		CommandRunID:   runID,
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(summary)
+}
+
+func saveImportedNmapHostnames(store *storage.Store, domain string, hostnames []portscan.ImportedHostname) (int, error) {
+	if len(hostnames) == 0 {
+		return 0, nil
+	}
+
+	ipsByHost := make(map[string][]string, len(hostnames))
+	for _, hostname := range hostnames {
+		host := normalizeImportedNmapHostname(domain, hostname.Hostname)
+		if host == "" {
+			continue
+		}
+		ip := net.ParseIP(strings.TrimSpace(hostname.IP))
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		ipsByHost[host] = append(ipsByHost[host], ip.To4().String())
+	}
+	if len(ipsByHost) == 0 {
+		return 0, nil
+	}
+
+	hosts := make([]string, 0, len(ipsByHost))
+	for host := range ipsByHost {
+		hosts = append(hosts, host)
+	}
+	slices.Sort(hosts)
+
+	entries := make([]discovery.Entry, 0, len(hosts))
+	resolutions := make([]resolver.Result, 0, len(hosts))
+	for _, host := range hosts {
+		ips := uniqueIPv4Targets(ipsByHost[host])
+		if len(ips) == 0 {
+			continue
+		}
+		entries = append(entries, discovery.Entry{
+			Subdomain: host,
+			Sources:   []string{"nmap-xml"},
+		})
+		resolutions = append(resolutions, resolver.Result{
+			Subdomain: host,
+			IPs:       ips,
+			Alive:     true,
+		})
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	// Save discoveries before resolutions because resolution updates target existing subdomain rows.
+	if err := store.SaveDiscoveries(domain, entries); err != nil {
+		return 0, err
+	}
+	if err := store.SaveResolutions(domain, resolutions); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+func normalizeImportedNmapHostname(domain string, hostname string) string {
+	host := strings.Trim(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	domain = strings.Trim(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if host == "" || domain == "" {
+		return ""
+	}
+	if host == domain || strings.HasSuffix(host, "."+domain) {
+		return host
+	}
+	return ""
 }
 
 // runPortscanRawAndSave handles raw nmap scans that takes target input from user's input and not from DB

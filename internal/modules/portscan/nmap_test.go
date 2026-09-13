@@ -46,6 +46,81 @@ func TestParseNmapXMLOpenPortsOnly(t *testing.T) {
 	}
 }
 
+func TestParseNmapXMLImportIncludesHostnamesAndSkipCount(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`<?xml version="1.0"?>
+<nmaprun start="1771300000">
+  <host>
+    <address addr="10.20.30.40" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="api.example.com" type="user"/>
+      <hostname name="www.example.com." type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="Apache httpd" version="2.4.62"/>
+      </port>
+      <port protocol="tcp" portid="81">
+        <state state="filtered"/>
+        <service name="http"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>`)
+
+	imported, err := ParseNmapXMLImport(raw, ImportOptions{})
+	if err != nil {
+		t.Fatalf("ParseNmapXMLImport: %v", err)
+	}
+	if imported.HostsSeen != 1 {
+		t.Fatalf("hosts seen=%d; want 1", imported.HostsSeen)
+	}
+	if imported.PortsSkipped != 1 {
+		t.Fatalf("ports skipped=%d; want 1", imported.PortsSkipped)
+	}
+	if len(imported.Results) != 1 {
+		t.Fatalf("len(results)=%d; want 1", len(imported.Results))
+	}
+	if imported.Results[0].Version != "Apache httpd 2.4.62" {
+		t.Fatalf("version=%q; want Apache httpd 2.4.62", imported.Results[0].Version)
+	}
+	if len(imported.Hostnames) != 2 {
+		t.Fatalf("len(hostnames)=%d; want 2", len(imported.Hostnames))
+	}
+	if imported.Hostnames[1].Hostname != "www.example.com" {
+		t.Fatalf("second hostname=%q; want www.example.com", imported.Hostnames[1].Hostname)
+	}
+}
+
+func TestParseNmapXMLImportCanIncludeNonOpen(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`<nmaprun>
+  <host>
+    <address addr="10.20.30.40" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="81">
+        <state state="filtered"/>
+        <service name="http"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>`)
+
+	imported, err := ParseNmapXMLImport(raw, ImportOptions{IncludeNonOpen: true})
+	if err != nil {
+		t.Fatalf("ParseNmapXMLImport: %v", err)
+	}
+	if len(imported.Results) != 1 {
+		t.Fatalf("len(results)=%d; want 1", len(imported.Results))
+	}
+	if imported.Results[0].State != "filtered" {
+		t.Fatalf("state=%q; want filtered", imported.Results[0].State)
+	}
+}
+
 func TestNormalizeIPv4TargetsFiltersAndSorts(t *testing.T) {
 	t.Parallel()
 

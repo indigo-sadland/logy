@@ -206,3 +206,27 @@ func TestFindSavedScanTargetReturnsErrorWhenMissing(t *testing.T) {
 		t.Fatal("expected error for missing target")
 	}
 }
+
+func TestNormalizeImportedNmapHostnameKeepsOnlyDomainSubdomains(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		domain   string
+		hostname string
+		want     string
+	}{
+		{name: "root domain", domain: "example.com", hostname: "Example.Com.", want: "example.com"},
+		{name: "subdomain", domain: "example.com", hostname: "API.Example.Com.", want: "api.example.com"},
+		{name: "outside domain", domain: "example.com", hostname: "api.other.com", want: ""},
+		{name: "suffix trap", domain: "example.com", hostname: "badexample.com", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeImportedNmapHostname(tt.domain, tt.hostname); got != tt.want {
+				t.Fatalf("got=%q; want %q", got, tt.want)
+			}
+		})
+	}
+}

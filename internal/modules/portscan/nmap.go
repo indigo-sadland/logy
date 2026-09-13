@@ -29,6 +29,23 @@ type Result struct {
 	ScannedAt time.Time
 }
 
+type ImportedHostname struct {
+	Hostname string
+	IP       string
+}
+
+type ImportOptions struct {
+	IncludeNonOpen bool
+}
+
+type ImportResult struct {
+	Results      []Result
+	Hostnames    []ImportedHostname
+	HostsSeen    int
+	PortsSkipped int
+	ScannedAt    time.Time
+}
+
 type ScanOutput struct {
 	Results      []Result
 	TempFilePath string
@@ -36,17 +53,23 @@ type ScanOutput struct {
 
 type nmapRun struct {
 	XMLName xml.Name   `xml:"nmaprun"`
+	Start   string     `xml:"start,attr"`
 	Hosts   []nmapHost `xml:"host"`
 }
 
 type nmapHost struct {
-	Addresses []nmapAddress `xml:"address"`
-	Ports     []nmapPort    `xml:"ports>port"`
+	Addresses []nmapAddress  `xml:"address"`
+	Hostnames []nmapHostname `xml:"hostnames>hostname"`
+	Ports     []nmapPort     `xml:"ports>port"`
 }
 
 type nmapAddress struct {
 	Addr     string `xml:"addr,attr"`
 	AddrType string `xml:"addrtype,attr"`
+}
+
+type nmapHostname struct {
+	Name string `xml:"name,attr"`
 }
 
 type nmapPort struct {
@@ -153,13 +176,27 @@ func ScanIPsDetailed(ctx context.Context, targets []string, cfg Config, userArgs
 
 // parseNmapXML extracts open-port scan results from nmap XML output.
 func parseNmapXML(raw []byte) ([]Result, error) {
+	imported, err := ParseNmapXMLImport(raw, ImportOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return imported.Results, nil
+}
+
+// ParseNmapXMLImport extracts ports and hostnames from saved nmap XML for DB import.
+func ParseNmapXMLImport(raw []byte, opts ImportOptions) (ImportResult, error) {
 	var payload nmapRun
 	if err := xml.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("parse nmap xml: %w", err)
+		return ImportResult{}, fmt.Errorf("parse nmap xml: %w", err)
+	}
+	if payload.XMLName.Local != "nmaprun" {
+		return ImportResult{}, fmt.Errorf("parse nmap xml: expected nmaprun root, got %q", payload.XMLName.Local)
 	}
 
-	scannedAt := time.Now().UTC()
+	scannedAt := nmapScannedAt(payload)
 	results := make([]Result, 0, 64)
+	hostnames := make([]ImportedHostname, 0, 64)
+	portsSkipped := 0
 	for _, host := range payload.Hosts {
 		ip := ""
 		for _, address := range host.Addresses {
@@ -172,19 +209,30 @@ func parseNmapXML(raw []byte) ([]Result, error) {
 			continue
 		}
 
+		// Hostname import keeps Asset aliases available after XML-only imports.
+		for _, hostname := range host.Hostnames {
+			name := strings.Trim(strings.ToLower(strings.TrimSpace(hostname.Name)), ".")
+			if name == "" {
+				continue
+			}
+			hostnames = append(hostnames, ImportedHostname{Hostname: name, IP: ip})
+		}
+
 		for _, port := range host.Ports {
-			if strings.TrimSpace(port.State.State) != "open" {
+			state := strings.TrimSpace(port.State.State)
+			if !opts.IncludeNonOpen && state != "open" {
+				portsSkipped++
 				continue
 			}
 			portID, err := strconv.Atoi(strings.TrimSpace(port.PortID))
 			if err != nil {
-				return nil, fmt.Errorf("parse nmap port %q: %w", port.PortID, err)
+				return ImportResult{}, fmt.Errorf("parse nmap port %q: %w", port.PortID, err)
 			}
 			results = append(results, Result{
 				IP:        ip,
 				Port:      portID,
 				Protocol:  strings.TrimSpace(port.Protocol),
-				State:     strings.TrimSpace(port.State.State),
+				State:     state,
 				Service:   strings.TrimSpace(port.Service.Name),
 				Version:   buildVersion(port.Service),
 				ScannedAt: scannedAt,
@@ -201,7 +249,40 @@ func parseNmapXML(raw []byte) ([]Result, error) {
 		}
 		return strings.Compare(a.Protocol, b.Protocol)
 	})
-	return results, nil
+	slices.SortFunc(hostnames, func(a, b ImportedHostname) int {
+		if cmp := strings.Compare(a.Hostname, b.Hostname); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(a.IP, b.IP)
+	})
+	return ImportResult{
+		Results:      results,
+		Hostnames:    uniqueImportedHostnames(hostnames),
+		HostsSeen:    len(payload.Hosts),
+		PortsSkipped: portsSkipped,
+		ScannedAt:    scannedAt,
+	}, nil
+}
+
+func nmapScannedAt(payload nmapRun) time.Time {
+	if unix, err := strconv.ParseInt(strings.TrimSpace(payload.Start), 10, 64); err == nil && unix > 0 {
+		return time.Unix(unix, 0).UTC()
+	}
+	return time.Now().UTC()
+}
+
+func uniqueImportedHostnames(values []ImportedHostname) []ImportedHostname {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]ImportedHostname, 0, len(values))
+	for _, value := range values {
+		key := value.Hostname + "|" + value.IP
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 // normalizeIPTargets trims, deduplicates, sorts, and filters scan targets down to IPv4 addresses.

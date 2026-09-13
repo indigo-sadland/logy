@@ -64,7 +64,7 @@ func init() {
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "deprecated shared Anytype alias property key fallback")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetAliasPropertyKey, "asset-alias-property", "alias", "Anytype property key for Asset aliases")
-	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceAliasPropertyKey, "service-alias-property", "alias", "Anytype property key for Service aliases")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceAliasPropertyKey, "service-alias-property", "hostnames,alias", "comma-separated Anytype property keys for Service aliases")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementPropertyKey, "engagement-property", "engagement", "Anytype property key for Engagement object links")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetPropertyKey, "asset-property", "asset", "Anytype property key for Asset object links")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.PortPropertyKey, "port-property", "port", "Anytype property key for Service port")
@@ -96,8 +96,6 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"web-app-observation-type",
 		"service-historical-observation-type",
 		"alias-property",
-		"asset-alias-property",
-		"service-alias-property",
 		"engagement-property",
 		"asset-property",
 		"port-property",
