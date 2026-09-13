@@ -31,7 +31,16 @@ var exportAnytypeCmd = &cobra.Command{
 	},
 }
 
+var exportCSVCmd = &cobra.Command{
+	Use:   "csv --domain example.com --file assets.csv",
+	Short: "Export resolved assets and saved TCP ports to semicolon-separated CSV",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runExportCSV(cmd)
+	},
+}
+
 var anytypeExport anytypeExportOptions
+var csvExport csvExportOptions
 
 type anytypeExportOptions struct {
 	exporter.AnytypeOptions
@@ -39,9 +48,16 @@ type anytypeExportOptions struct {
 	Yes        bool
 }
 
+type csvExportOptions struct {
+	Domain     string
+	File       string
+	ConfigPath string
+}
+
 func init() {
 	rootCmd.AddCommand(exportCmd)
 	exportCmd.AddCommand(exportAnytypeCmd)
+	exportCmd.AddCommand(exportCSVCmd)
 
 	exportAnytypeCmd.Flags().StringVarP(&anytypeExport.Domain, "domain", "d", "", "root domain to export from the database")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementName, "engagement", "", "Anytype Engagement object name to link exported objects to")
@@ -83,6 +99,10 @@ func init() {
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationObservedBannerPropertyKey, "service-historical-observation-banner-property", "observed_banner", "Anytype property key for historical observation banner")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationObservedServicePropertyKey, "service-historical-observation-service-property", "observed_service", "Anytype property key for historical observation service")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.HistoricalObservationTimestampPropertyKey, "service-historical-observation-timestamp-property", "timestamp", "Anytype property key for historical observation timestamp")
+
+	exportCSVCmd.Flags().StringVarP(&csvExport.Domain, "domain", "d", "", "root domain to export from the database")
+	exportCSVCmd.Flags().StringVarP(&csvExport.File, "file", "f", "", "path to write semicolon-separated CSV")
+	exportCSVCmd.Flags().StringVar(&csvExport.ConfigPath, "config", defaultConfigPath(), "path to logy's config yaml")
 
 	hideAnytypeAdvancedFlags(exportAnytypeCmd)
 }
@@ -294,6 +314,83 @@ func loadAnytypeExportData(store *storage.Store, opts anytypeExportOptions) (any
 	}
 
 	return data, nil
+}
+
+func runExportCSV(cmd *cobra.Command) error {
+	opts, err := normalizeCSVExportOptions(csvExport)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(opts.ConfigPath)
+	if err != nil {
+		return err
+	}
+
+	store, err := storage.Open(cfg.Database.Path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	subdomains, err := store.SubdomainsByDomain(opts.Domain)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("no subdomains for domain %s\n", opts.Domain)
+		}
+		return err
+	}
+
+	scans, err := store.PortScansByDomain(opts.Domain)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		scans = nil
+	}
+
+	file, err := os.Create(opts.File)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	rows, err := exporter.ExportCSV(file, subdomains, scans)
+	if err != nil {
+		return err
+	}
+
+	summary := struct {
+		Domain   string `json:"domain"`
+		File     string `json:"file"`
+		Database string `json:"database"`
+		Rows     int    `json:"rows"`
+	}{
+		Domain:   opts.Domain,
+		File:     opts.File,
+		Database: cfg.Database.Path,
+		Rows:     rows,
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(summary)
+}
+
+func normalizeCSVExportOptions(opts csvExportOptions) (csvExportOptions, error) {
+	opts.Domain = strings.TrimSpace(opts.Domain)
+	opts.File = strings.TrimSpace(opts.File)
+	opts.ConfigPath = strings.TrimSpace(opts.ConfigPath)
+	if opts.Domain == "" {
+		return csvExportOptions{}, fmt.Errorf("--domain is required\n")
+	}
+	if opts.File == "" {
+		return csvExportOptions{}, fmt.Errorf("--file is required\n")
+	}
+	if opts.ConfigPath == "" {
+		return csvExportOptions{}, fmt.Errorf("--config is required\n")
+	}
+	return opts, nil
 }
 
 func normalizeAnytypeExportOptions(opts anytypeExportOptions) anytypeExportOptions {

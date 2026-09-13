@@ -15,8 +15,8 @@ import (
 	"github.com/indigo-sadland/logy/internal/storage"
 	"github.com/indigo-sadland/logy/internal/utils/output"
 	"github.com/indigo-sadland/logy/internal/utils/puredns"
-
 	"github.com/mattn/go-isatty"
+
 	"github.com/spf13/cobra"
 )
 
