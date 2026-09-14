@@ -12,7 +12,10 @@ func (s *Store) init() error {
 	if err := s.migrateServiceHistoricalObservationsSchema(); err != nil {
 		return err
 	}
-	return s.migrateCommandRunsSchema()
+	if err := s.migrateCommandRunsSchema(); err != nil {
+		return err
+	}
+	return s.migratePortScanTargetsSchema()
 }
 
 const sqliteSchema = `
@@ -53,6 +56,18 @@ CREATE TABLE IF NOT EXISTS port_scans (
     version TEXT NOT NULL DEFAULT '',
     scanned_at TEXT NOT NULL,
     UNIQUE(domain, ip, port, protocol)
+);
+
+CREATE TABLE IF NOT EXISTS port_scan_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    scanner TEXT NOT NULL DEFAULT 'nmap',
+    status TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    command_run_id INTEGER,
+    UNIQUE(domain, ip, scanner)
 );
 
 CREATE TABLE IF NOT EXISTS service_historical_observations (
@@ -177,4 +192,21 @@ func sqliteDuplicateColumnError(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
+}
+
+func (s *Store) migratePortScanTargetsSchema() error {
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS port_scan_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    scanner TEXT NOT NULL DEFAULT 'nmap',
+    status TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    command_run_id INTEGER,
+    UNIQUE(domain, ip, scanner)
+)
+`)
+	return err
 }

@@ -589,6 +589,49 @@ func TestSavePortScansUpsertsLatestState(t *testing.T) {
 	}
 }
 
+func TestSavePortScanTargetsUpsertsLatestStatus(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recon.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	first := PortScanTargetRecord{
+		Domain:    "example.com",
+		IP:        "203.0.113.10",
+		Hostname:  "old.example.com",
+		Scanner:   "nmap",
+		Status:    "scanned",
+		ScannedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	second := first
+	second.Hostname = "app.example.com"
+	second.ScannedAt = time.Now().UTC()
+	second.CommandRunID = sql.NullInt64{Int64: 42, Valid: true}
+
+	if err := store.SavePortScanTargets("example.com", []PortScanTargetRecord{first}); err != nil {
+		t.Fatalf("save port scan targets #1: %v", err)
+	}
+	if err := store.SavePortScanTargets("example.com", []PortScanTargetRecord{second}); err != nil {
+		t.Fatalf("save port scan targets #2: %v", err)
+	}
+
+	records, err := store.PortScanTargetsByDomain("example.com")
+	if err != nil {
+		t.Fatalf("port scan targets by domain: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("len(records)=%d; want 1", len(records))
+	}
+	if records[0].Hostname != "app.example.com" {
+		t.Fatalf("hostname=%q; want app.example.com", records[0].Hostname)
+	}
+	if !records[0].CommandRunID.Valid || records[0].CommandRunID.Int64 != 42 {
+		t.Fatalf("command run id=%v; want 42", records[0].CommandRunID)
+	}
+}
+
 func TestCommandRunsLifecycle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "recon.db")
 	store, err := Open(dbPath)

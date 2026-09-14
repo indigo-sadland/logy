@@ -48,6 +48,60 @@ ON CONFLICT(domain, ip, port, protocol) DO UPDATE SET
 	return tx.Commit()
 }
 
+// SavePortScanTargets upserts IPs that nmap attempted to scan, even when no open ports were found.
+func (s *Store) SavePortScanTargets(domain string, targets []PortScanTargetRecord) error {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`
+INSERT INTO port_scan_targets(domain, ip, hostname, scanner, status, scanned_at, command_run_id)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(domain, ip, scanner) DO UPDATE SET
+    hostname=excluded.hostname,
+    status=excluded.status,
+    scanned_at=excluded.scanned_at,
+    command_run_id=excluded.command_run_id
+`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, target := range targets {
+		scanner := target.Scanner
+		if scanner == "" {
+			scanner = "nmap"
+		}
+		status := target.Status
+		if status == "" {
+			status = "scanned"
+		}
+		scannedAt := target.ScannedAt
+		if scannedAt.IsZero() {
+			scannedAt = time.Now().UTC()
+		}
+		if _, err := stmt.Exec(
+			domain,
+			target.IP,
+			target.Hostname,
+			scanner,
+			status,
+			scannedAt.UTC().Format(time.RFC3339),
+			target.CommandRunID,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // PortScansByDomain returns stored open-port scan results for a domain ordered by IP and port.
 func (s *Store) PortScansByDomain(domain string) ([]PortScanRecord, error) {
 	rows, err := s.db.Query(`
@@ -74,6 +128,50 @@ ORDER BY ip ASC, port ASC, protocol ASC
 			&record.Service,
 			&record.Version,
 			&scannedAt,
+		); err != nil {
+			return nil, err
+		}
+		parsedScannedAt, err := time.Parse(time.RFC3339, scannedAt)
+		if err != nil {
+			return nil, err
+		}
+		record.ScannedAt = parsedScannedAt
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return records, nil
+}
+
+// PortScanTargetsByDomain returns nmap target status rows ordered by IP and scanner.
+func (s *Store) PortScanTargetsByDomain(domain string) ([]PortScanTargetRecord, error) {
+	rows, err := s.db.Query(`
+SELECT domain, ip, hostname, scanner, status, scanned_at, command_run_id
+FROM port_scan_targets
+WHERE domain=?
+ORDER BY ip ASC, scanner ASC
+`, domain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	records := make([]PortScanTargetRecord, 0, 128)
+	for rows.Next() {
+		var record PortScanTargetRecord
+		var scannedAt string
+		if err := rows.Scan(
+			&record.Domain,
+			&record.IP,
+			&record.Hostname,
+			&record.Scanner,
+			&record.Status,
+			&scannedAt,
+			&record.CommandRunID,
 		); err != nil {
 			return nil, err
 		}

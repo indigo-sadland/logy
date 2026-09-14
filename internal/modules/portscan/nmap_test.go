@@ -68,17 +68,26 @@ func TestParseNmapXMLImportIncludesHostnamesAndSkipCount(t *testing.T) {
       </port>
     </ports>
   </host>
+  <host>
+    <address addr="10.20.30.41" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="closed"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
 </nmaprun>`)
 
 	imported, err := ParseNmapXMLImport(raw, ImportOptions{})
 	if err != nil {
 		t.Fatalf("ParseNmapXMLImport: %v", err)
 	}
-	if imported.HostsSeen != 1 {
-		t.Fatalf("hosts seen=%d; want 1", imported.HostsSeen)
+	if imported.HostsSeen != 2 {
+		t.Fatalf("hosts seen=%d; want 2", imported.HostsSeen)
 	}
-	if imported.PortsSkipped != 1 {
-		t.Fatalf("ports skipped=%d; want 1", imported.PortsSkipped)
+	if imported.PortsSkipped != 2 {
+		t.Fatalf("ports skipped=%d; want 2", imported.PortsSkipped)
 	}
 	if len(imported.Results) != 1 {
 		t.Fatalf("len(results)=%d; want 1", len(imported.Results))
@@ -91,6 +100,9 @@ func TestParseNmapXMLImportIncludesHostnamesAndSkipCount(t *testing.T) {
 	}
 	if imported.Hostnames[1].Hostname != "www.example.com" {
 		t.Fatalf("second hostname=%q; want www.example.com", imported.Hostnames[1].Hostname)
+	}
+	if !slices.Equal(imported.ScannedIPs, []string{"10.20.30.40", "10.20.30.41"}) {
+		t.Fatalf("scanned IPs=%v; want both hosts", imported.ScannedIPs)
 	}
 }
 

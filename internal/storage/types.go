@@ -73,6 +73,16 @@ type PortScanRecord struct {
 	ScannedAt time.Time
 }
 
+type PortScanTargetRecord struct {
+	Domain       string
+	IP           string
+	Hostname     string
+	Scanner      string
+	Status       string
+	ScannedAt    time.Time
+	CommandRunID sql.NullInt64
+}
+
 type ServiceHistoricalObservationRecord struct {
 	Domain          string
 	HostIP          string

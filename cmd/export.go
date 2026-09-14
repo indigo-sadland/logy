@@ -80,6 +80,8 @@ func init() {
 
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AliasPropertyKey, "alias-property", "alias", "deprecated shared Anytype alias property key fallback")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetAliasPropertyKey, "asset-alias-property", "alias", "Anytype property key for Asset aliases")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetPortScannedPropertyKey, "asset-port-scanned-property", "port_scanned", "Anytype property key for Asset port-scanned status")
+	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetLastPortScanPropertyKey, "asset-last-port-scan-property", "last_port_scan", "Anytype property key for Asset last port scan timestamp")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.ServiceAliasPropertyKey, "service-alias-property", "hostnames,alias", "comma-separated Anytype property keys for Service aliases")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.EngagementPropertyKey, "engagement-property", "engagement", "Anytype property key for Engagement object links")
 	exportAnytypeCmd.Flags().StringVar(&anytypeExport.AssetPropertyKey, "asset-property", "asset", "Anytype property key for Asset object links")
@@ -116,6 +118,8 @@ func hideAnytypeAdvancedFlags(cmd *cobra.Command) {
 		"web-app-observation-type",
 		"service-historical-observation-type",
 		"alias-property",
+		"asset-port-scanned-property",
+		"asset-last-port-scan-property",
 		"engagement-property",
 		"asset-property",
 		"port-property",
@@ -179,7 +183,7 @@ func runExportAnytype(cmd *cobra.Command) error {
 		return err
 	}
 
-	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.observations, data.webProbes, data.runs)
+	preview, err := exporter.PreviewAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.scanTargets, data.observations, data.webProbes, data.runs)
 	if err != nil {
 		return err
 	}
@@ -196,7 +200,7 @@ func runExportAnytype(cmd *cobra.Command) error {
 	}
 
 	// Export uses the same preview inputs so suspicious-host counts stay aligned.
-	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.observations, data.webProbes, data.runs)
+	result, err := exporter.ExportAnytype(cmd.Context(), opts.AnytypeOptions, data.subdomains, data.scans, data.scanTargets, data.observations, data.webProbes, data.runs)
 	if err != nil {
 		return err
 	}
@@ -253,6 +257,7 @@ func runExportAnytype(cmd *cobra.Command) error {
 type anytypeExportData struct {
 	subdomains   []storage.SubdomainRecord
 	scans        []storage.PortScanRecord
+	scanTargets  []storage.PortScanTargetRecord
 	observations []storage.ServiceHistoricalObservationRecord
 	webProbes    []storage.WebProbeRecord
 	runs         []storage.CommandRunRecord
@@ -278,6 +283,16 @@ func loadAnytypeExportData(store *storage.Store, opts anytypeExportOptions) (any
 			return anytypeExportData{}, err
 		}
 		data.scans = nil
+	}
+
+	if !opts.OnlyScans {
+		data.scanTargets, err = store.PortScanTargetsByDomain(opts.Domain)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return anytypeExportData{}, err
+			}
+			data.scanTargets = nil
+		}
 	}
 
 	data.runs, err = store.CommandRunsByDomain(opts.Domain)

@@ -41,6 +41,8 @@ type AnytypeOptions struct {
 
 	AliasPropertyKey                                string
 	AssetAliasPropertyKey                           string
+	AssetPortScannedPropertyKey                     string
+	AssetLastPortScanPropertyKey                    string
 	ServiceAliasPropertyKey                         string
 	EngagementPropertyKey                           string
 	AssetPropertyKey                                string
@@ -143,9 +145,10 @@ type anytypeUpdateObjectRequest struct {
 }
 
 type anytypeAssetExport struct {
-	IP      string
-	Aliases []string
-	ID      string
+	IP         string
+	Aliases    []string
+	ScanTarget *storage.PortScanTargetRecord
+	ID         string
 }
 
 type anytypeObject struct {
@@ -155,13 +158,13 @@ type anytypeObject struct {
 
 // ExportAnytype pushes saved subdomain, service, web probe, and command run
 // state into Anytype.
-func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
+func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, scanTargets []storage.PortScanTargetRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypeResult, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypeResult{}, err
 	}
 
-	assets := buildAnytypeAssets(subdomains, scans)
+	assets := buildAnytypeAssets(subdomains, scans, scanTargets)
 	// Scan-only mode skips the asset/service graph entirely.
 	if !opts.OnlyScans && len(assets) == 0 {
 		return AnytypeResult{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
@@ -190,8 +193,8 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			if existing != nil {
 				assets[i].ID = existing.ID
 				reusedAssets++
-				if updated, err := client.mergeAssetAliases(ctx, existing, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
-					return AnytypeResult{}, fmt.Errorf("update Anytype asset %s aliases: %w", assets[i].IP, err)
+				if updated, err := client.mergeAssetProperties(ctx, existing, opts, engagementID, assets[i]); err != nil {
+					return AnytypeResult{}, fmt.Errorf("update Anytype asset %s properties: %w", assets[i].IP, err)
 				} else if updated {
 					updatedAssets++
 				}
@@ -202,14 +205,14 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 			assetID, err := client.createObject(ctx, anytypeCreateObjectRequest{
 				TypeKey:    opts.AssetTypeKey,
 				Name:       assets[i].IP,
-				Properties: anytypeAssetProperties(opts, engagementID, assets[i].Aliases),
+				Properties: anytypeAssetRequiredProperties(opts, engagementID, assets[i].Aliases),
 			})
 			if err != nil {
 				return AnytypeResult{}, fmt.Errorf("create Anytype asset %s: %w", assets[i].IP, err)
 			}
 			// Patch the asset once after creation so alias and engagement land the
 			// same way on both new and reused Asset objects.
-			if err := client.setAssetProperties(ctx, assetID, opts.AssetAliasPropertyKey, opts.EngagementPropertyKey, engagementID, assets[i].Aliases); err != nil {
+			if err := client.setAssetProperties(ctx, assetID, opts, engagementID, assets[i].Aliases, assets[i].ScanTarget); err != nil {
 				return AnytypeResult{}, fmt.Errorf("update Anytype asset %s properties: %w", assets[i].IP, err)
 			}
 			assets[i].ID = assetID
@@ -482,13 +485,13 @@ func countExportableHistoricalObservations(observations []storage.ServiceHistori
 }
 
 // PreviewAnytype resolves the target engagement and counts the objects that would be created without mutating Anytype.
-func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
+func PreviewAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, scanTargets []storage.PortScanTargetRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord) (AnytypePreview, error) {
 	opts = NormalizeAnytypeOptions(opts)
 	if err := ValidateAnytypeOptions(opts); err != nil {
 		return AnytypePreview{}, err
 	}
 
-	assets := buildAnytypeAssets(subdomains, scans)
+	assets := buildAnytypeAssets(subdomains, scans, scanTargets)
 	if !opts.OnlyScans && len(assets) == 0 {
 		return AnytypePreview{}, fmt.Errorf("no resolved IP assets found for domain %s\n", opts.Domain)
 	}
@@ -572,6 +575,8 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.ServiceHistoricalObservationTypeKey = strings.TrimSpace(opts.ServiceHistoricalObservationTypeKey)
 	opts.AliasPropertyKey = strings.TrimSpace(opts.AliasPropertyKey)
 	opts.AssetAliasPropertyKey = strings.TrimSpace(opts.AssetAliasPropertyKey)
+	opts.AssetPortScannedPropertyKey = strings.TrimSpace(opts.AssetPortScannedPropertyKey)
+	opts.AssetLastPortScanPropertyKey = strings.TrimSpace(opts.AssetLastPortScanPropertyKey)
 	opts.ServiceAliasPropertyKey = strings.TrimSpace(opts.ServiceAliasPropertyKey)
 	opts.EngagementPropertyKey = strings.TrimSpace(opts.EngagementPropertyKey)
 	opts.AssetPropertyKey = strings.TrimSpace(opts.AssetPropertyKey)
@@ -592,6 +597,12 @@ func NormalizeAnytypeOptions(opts AnytypeOptions) AnytypeOptions {
 	opts.HistoricalObservationTimestampPropertyKey = strings.TrimSpace(opts.HistoricalObservationTimestampPropertyKey)
 	if opts.AssetAliasPropertyKey == "" {
 		opts.AssetAliasPropertyKey = opts.AliasPropertyKey
+	}
+	if opts.AssetPortScannedPropertyKey == "" {
+		opts.AssetPortScannedPropertyKey = "port_scanned"
+	}
+	if opts.AssetLastPortScanPropertyKey == "" {
+		opts.AssetLastPortScanPropertyKey = "last_port_scan"
 	}
 	if opts.ServiceAliasPropertyKey == "" {
 		opts.ServiceAliasPropertyKey = "hostnames,alias"
@@ -617,8 +628,8 @@ func ValidateAnytypeOptions(opts AnytypeOptions) error {
 		return fmt.Errorf("--anytype-version or ANYTYPE_VERSION is required\n")
 	case opts.EngagementTypeKey == "" || opts.AssetTypeKey == "" || opts.ServiceTypeKey == "" || opts.ScanTypeKey == "" || opts.WebAppObservationTypeKey == "" || opts.ServiceHistoricalObservationTypeKey == "":
 		return fmt.Errorf("Anytype type keys must not be empty\n")
-	case opts.AssetAliasPropertyKey == "":
-		return fmt.Errorf("Anytype asset alias property key must not be empty\n")
+	case opts.AssetAliasPropertyKey == "" || opts.AssetPortScannedPropertyKey == "" || opts.AssetLastPortScanPropertyKey == "":
+		return fmt.Errorf("Anytype asset property keys must not be empty\n")
 	case opts.ScanStatusPropertyKey == "" || opts.TimestampPropertyKey == "":
 		return fmt.Errorf("Anytype scan property keys must not be empty\n")
 	case opts.WebAppObservationTitlePropertyKey == "" || opts.WebAppObservationStatusCodePropertyKey == "" || opts.WebAppObservationTechnologiesPropertyKey == "":
@@ -640,7 +651,16 @@ func anytypeCommandRunProperties(opts AnytypeOptions, engagementID string, run s
 	}
 }
 
-func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []string) []anytypeProperty {
+func anytypeAssetProperties(opts AnytypeOptions, engagementID string, aliases []string, scanTarget *storage.PortScanTargetRecord) []anytypeProperty {
+	properties := anytypeAssetRequiredProperties(opts, engagementID, aliases)
+	properties = append(properties,
+		textProperty(opts.AssetPortScannedPropertyKey, anytypePortScannedValue(scanTarget)),
+		textProperty(opts.AssetLastPortScanPropertyKey, anytypeLastPortScanValue(scanTarget)),
+	)
+	return properties
+}
+
+func anytypeAssetRequiredProperties(opts AnytypeOptions, engagementID string, aliases []string) []anytypeProperty {
 	return []anytypeProperty{
 		textProperty(opts.AssetAliasPropertyKey, strings.Join(aliases, ", ")),
 		objectsProperty(opts.EngagementPropertyKey, engagementID),
@@ -704,7 +724,7 @@ func suspiciousPortscanIPs(scans []storage.PortScanRecord, threshold int) map[st
 	return suspicious
 }
 
-func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord) []anytypeAssetExport {
+func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.PortScanRecord, scanTargets []storage.PortScanTargetRecord) []anytypeAssetExport {
 	// Assets are IP-centric: the IP becomes the Anytype object name and all
 	// resolved subdomains pointing to it become the Alias property.
 	aliasesByIP := make(map[string]map[string]struct{}, len(subdomains))
@@ -734,6 +754,12 @@ func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.Po
 			aliasesByIP[ip] = make(map[string]struct{}, 1)
 		}
 	}
+	targetByIP := latestPortScanTargetByIP(scanTargets)
+	for ip := range targetByIP {
+		if _, ok := aliasesByIP[ip]; !ok {
+			aliasesByIP[ip] = make(map[string]struct{}, 1)
+		}
+	}
 
 	ips := make([]string, 0, len(aliasesByIP))
 	for ip := range aliasesByIP {
@@ -748,9 +774,26 @@ func buildAnytypeAssets(subdomains []storage.SubdomainRecord, scans []storage.Po
 			aliases = append(aliases, alias)
 		}
 		slices.Sort(aliases)
-		assets = append(assets, anytypeAssetExport{IP: ip, Aliases: aliases})
+		assets = append(assets, anytypeAssetExport{IP: ip, Aliases: aliases, ScanTarget: targetByIP[ip]})
 	}
 	return assets
+}
+
+func latestPortScanTargetByIP(targets []storage.PortScanTargetRecord) map[string]*storage.PortScanTargetRecord {
+	out := make(map[string]*storage.PortScanTargetRecord, len(targets))
+	for _, target := range targets {
+		ip := strings.TrimSpace(target.IP)
+		if ip == "" {
+			continue
+		}
+		existing := out[ip]
+		if existing != nil && !target.ScannedAt.After(existing.ScannedAt) {
+			continue
+		}
+		copyTarget := target
+		out[ip] = &copyTarget
+	}
+	return out
 }
 
 func newAnytypeClient(opts AnytypeOptions) anytypeClient {
@@ -767,6 +810,20 @@ func newAnytypeClient(opts AnytypeOptions) anytypeClient {
 
 func anytypeServiceObservationKey(ip string, port int, protocol string) string {
 	return strings.TrimSpace(ip) + "|" + strconv.Itoa(port) + "|" + strings.ToLower(strings.TrimSpace(protocol))
+}
+
+func anytypePortScannedValue(target *storage.PortScanTargetRecord) string {
+	if target == nil {
+		return "no"
+	}
+	return "yes"
+}
+
+func anytypeLastPortScanValue(target *storage.PortScanTargetRecord) string {
+	if target == nil || target.ScannedAt.IsZero() {
+		return ""
+	}
+	return target.ScannedAt.UTC().Format(time.RFC3339)
 }
 
 func anytypePortValue(port int, protocol string) string {
@@ -912,33 +969,45 @@ func (c anytypeClient) getObject(ctx context.Context, id string) (map[string]any
 	return anytypeResponseObject(raw), nil
 }
 
-func (c anytypeClient) mergeAssetAliases(ctx context.Context, object *anytypeObject, aliasPropertyKey string, engagementPropertyKey string, engagementID string, aliases []string) (bool, error) {
+func (c anytypeClient) mergeAssetProperties(ctx context.Context, object *anytypeObject, opts AnytypeOptions, engagementID string, asset anytypeAssetExport) (bool, error) {
 	// Preserve aliases that users added in Anytype while appending Logy's latest
 	// hostname set for the IP asset.
-	existingAliases := splitAliasText(anytypePropertyString(object.Raw, aliasPropertyKey))
-	mergedAliases := mergeAliasValues(existingAliases, aliases)
-	if slices.Equal(existingAliases, mergedAliases) {
+	existingAliases := splitAliasText(anytypePropertyString(object.Raw, opts.AssetAliasPropertyKey))
+	mergedAliases := mergeAliasValues(existingAliases, asset.Aliases)
+	if slices.Equal(existingAliases, mergedAliases) && asset.ScanTarget == nil {
 		return false, nil
 	}
 	_, err := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
-		Properties: []anytypeProperty{
-			textProperty(aliasPropertyKey, strings.Join(mergedAliases, ", ")),
-			objectsProperty(engagementPropertyKey, engagementID),
-		},
+		Properties: anytypeAssetProperties(opts, engagementID, mergedAliases, asset.ScanTarget),
 	})
 	if err != nil {
+		if asset.ScanTarget != nil && isAnytypeUnknownPropertyKeyError(err) {
+			// Port scan status fields are optional for older Anytype templates.
+			// Keep the Asset export working when those property keys are absent.
+			_, fallbackErr := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
+				Properties: anytypeAssetRequiredProperties(opts, engagementID, mergedAliases),
+			})
+			if fallbackErr == nil {
+				return true, nil
+			}
+			return false, fallbackErr
+		}
 		return false, err
 	}
 	return true, nil
 }
 
-func (c anytypeClient) setAssetProperties(ctx context.Context, id string, aliasPropertyKey string, engagementPropertyKey string, engagementID string, aliases []string) error {
+func (c anytypeClient) setAssetProperties(ctx context.Context, id string, opts AnytypeOptions, engagementID string, aliases []string, scanTarget *storage.PortScanTargetRecord) error {
 	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
-		Properties: anytypeAssetProperties(AnytypeOptions{
-			AssetAliasPropertyKey: aliasPropertyKey,
-			EngagementPropertyKey: engagementPropertyKey,
-		}, engagementID, aliases),
+		Properties: anytypeAssetProperties(opts, engagementID, aliases, scanTarget),
 	})
+	if err != nil && scanTarget != nil && isAnytypeUnknownPropertyKeyError(err) {
+		// New scan-status properties should enrich Assets, not make existing
+		// Anytype spaces unusable until users add the optional fields.
+		_, err = c.updateObject(ctx, id, anytypeUpdateObjectRequest{
+			Properties: anytypeAssetRequiredProperties(opts, engagementID, aliases),
+		})
+	}
 	return err
 }
 

@@ -41,6 +41,7 @@ type ImportOptions struct {
 type ImportResult struct {
 	Results      []Result
 	Hostnames    []ImportedHostname
+	ScannedIPs   []string
 	HostsSeen    int
 	PortsSkipped int
 	ScannedAt    time.Time
@@ -48,6 +49,7 @@ type ImportResult struct {
 
 type ScanOutput struct {
 	Results      []Result
+	ScannedIPs   []string
 	TempFilePath string
 }
 
@@ -148,12 +150,12 @@ func ScanDetailed(ctx context.Context, cfg Config, userArgs []string) (ScanOutpu
 		return ScanOutput{}, fmt.Errorf("read nmap xml output: %w", err)
 	}
 
-	results, err := parseNmapXML(rawXML)
+	imported, err := ParseNmapXMLImport(rawXML, ImportOptions{})
 	if err != nil {
 		return ScanOutput{}, err
 	}
 
-	output := ScanOutput{Results: results}
+	output := ScanOutput{Results: imported.Results, ScannedIPs: imported.ScannedIPs}
 	if cfg.SaveTempFile {
 		output.TempFilePath = xmlFilePath
 		cleanupXMLFile = false
@@ -196,6 +198,7 @@ func ParseNmapXMLImport(raw []byte, opts ImportOptions) (ImportResult, error) {
 	scannedAt := nmapScannedAt(payload)
 	results := make([]Result, 0, 64)
 	hostnames := make([]ImportedHostname, 0, 64)
+	scannedIPs := make([]string, 0, len(payload.Hosts))
 	portsSkipped := 0
 	for _, host := range payload.Hosts {
 		ip := ""
@@ -208,6 +211,7 @@ func ParseNmapXMLImport(raw []byte, opts ImportOptions) (ImportResult, error) {
 		if net.ParseIP(ip) == nil || strings.Contains(ip, ":") {
 			continue
 		}
+		scannedIPs = append(scannedIPs, ip)
 
 		// Hostname import keeps Asset aliases available after XML-only imports.
 		for _, hostname := range host.Hostnames {
@@ -258,10 +262,30 @@ func ParseNmapXMLImport(raw []byte, opts ImportOptions) (ImportResult, error) {
 	return ImportResult{
 		Results:      results,
 		Hostnames:    uniqueImportedHostnames(hostnames),
+		ScannedIPs:   uniqueIPv4Strings(scannedIPs),
 		HostsSeen:    len(payload.Hosts),
 		PortsSkipped: portsSkipped,
 		ScannedAt:    scannedAt,
 	}, nil
+}
+
+func uniqueIPv4Strings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		ip := net.ParseIP(strings.TrimSpace(value))
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		value = ip.To4().String()
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	slices.Sort(out)
+	return out
 }
 
 func nmapScannedAt(payload nmapRun) time.Time {

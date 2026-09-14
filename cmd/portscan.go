@@ -235,6 +235,9 @@ func runPortscanImport(cmd *cobra.Command) error {
 	if err := store.FinishCommandRun(runID, "completed", 0, finishedAt, "", sql.NullInt64{}, ""); err != nil {
 		return err
 	}
+	if err := store.SavePortScanTargets(domain, buildPortScanTargetRecords(domain, imported.ScannedIPs, nil, imported.ScannedAt, sql.NullInt64{Int64: runID, Valid: true})); err != nil {
+		return err
+	}
 
 	summary := struct {
 		Domain         string `json:"domain"`
@@ -378,6 +381,9 @@ func runPortscanRawAndSave(cmd *cobra.Command, args []string) error {
 	if err := store.SavePortScans(domain, records); err != nil {
 		return err
 	}
+	if err := store.SavePortScanTargets(domain, buildPortScanTargetRecords(domain, scanOutput.ScannedIPs, nil, scanTimeFromResults(scanOutput.Results), sql.NullInt64{})); err != nil {
+		return err
+	}
 
 	summary := struct {
 		Domain       string   `json:"domain"`
@@ -464,6 +470,9 @@ func runPortscanFromDB(cmd *cobra.Command, args []string) error {
 		})
 	}
 	if err := store.SavePortScans(domain, records); err != nil {
+		return err
+	}
+	if err := store.SavePortScanTargets(domain, buildPortScanTargetRecords(domain, scanOutput.ScannedIPs, nil, scanTimeFromResults(scanOutput.Results), sql.NullInt64{})); err != nil {
 		return err
 	}
 
@@ -600,6 +609,9 @@ func runSavedTargetScan(cmd *cobra.Command, cfg config.Config, store *storage.St
 		})
 	}
 	if err := store.SavePortScans(domain, records); err != nil {
+		return err
+	}
+	if err := store.SavePortScanTargets(domain, buildPortScanTargetRecords(domain, scanOutput.ScannedIPs, selectedLabelByIP(selected), scanTimeFromResults(scanOutput.Results), sql.NullInt64{})); err != nil {
 		return err
 	}
 
@@ -752,6 +764,47 @@ func writePortscanShowText(out io.Writer, hosts []portscanShowHost) error {
 		}
 	}
 	return nil
+}
+
+func buildPortScanTargetRecords(domain string, ips []string, hostnamesByIP map[string]string, scannedAt time.Time, commandRunID sql.NullInt64) []storage.PortScanTargetRecord {
+	ips = uniqueIPv4Targets(ips)
+	if scannedAt.IsZero() {
+		scannedAt = time.Now().UTC()
+	}
+	records := make([]storage.PortScanTargetRecord, 0, len(ips))
+	for _, ip := range ips {
+		records = append(records, storage.PortScanTargetRecord{
+			Domain:       domain,
+			IP:           ip,
+			Hostname:     strings.TrimSpace(hostnamesByIP[ip]),
+			Scanner:      "nmap",
+			Status:       "scanned",
+			ScannedAt:    scannedAt,
+			CommandRunID: commandRunID,
+		})
+	}
+	return records
+}
+
+func selectedLabelByIP(selected portscanPickCandidate) map[string]string {
+	out := make(map[string]string, len(selected.IPs))
+	label := strings.TrimSpace(selected.Label)
+	if label == "" || strings.EqualFold(selected.Kind, "ip") {
+		return out
+	}
+	for _, ip := range selected.IPs {
+		out[ip] = label
+	}
+	return out
+}
+
+func scanTimeFromResults(results []portscan.Result) time.Time {
+	for _, result := range results {
+		if !result.ScannedAt.IsZero() {
+			return result.ScannedAt
+		}
+	}
+	return time.Now().UTC()
 }
 
 func uniqueIPv4Targets(targets []string) []string {
