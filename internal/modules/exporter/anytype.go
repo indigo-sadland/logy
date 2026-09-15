@@ -173,7 +173,7 @@ func ExportAnytype(ctx context.Context, opts AnytypeOptions, subdomains []storag
 	client := newAnytypeClient(opts)
 	// Suspicious hosts still keep their Scan and web probe evidence.
 	suspiciousHosts := suspiciousPortscanIPs(scans, opts.SuspiciousOpenPorts)
-	progress := newAnytypeProgressState(opts, scans, observations, webProbes, runs, suspiciousHosts)
+	progress := newAnytypeProgressState(opts, len(assets), scans, observations, webProbes, runs, suspiciousHosts)
 
 	engagementID, err := client.findObjectByName(ctx, opts.EngagementTypeKey, opts.EngagementName)
 	if err != nil {
@@ -431,18 +431,24 @@ type anytypeProgressState struct {
 }
 
 // Build one stable total up front so the CLI bar does not jump between phases.
-func newAnytypeProgressState(opts AnytypeOptions, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord, suspiciousHosts map[string]struct{}) *anytypeProgressState {
+func newAnytypeProgressState(opts AnytypeOptions, assets int, scans []storage.PortScanRecord, observations []storage.ServiceHistoricalObservationRecord, webProbes []storage.WebProbeRecord, runs []storage.CommandRunRecord, suspiciousHosts map[string]struct{}) *anytypeProgressState {
 	if opts.Progress == nil {
 		return &anytypeProgressState{}
 	}
 
 	total := 1 + len(runs) // engagement lookup + scans
 	if !opts.OnlyScans {
+		total += assets
 		total += countExportableServices(scans, suspiciousHosts)
 		total += countExportableHistoricalObservations(observations, scans, suspiciousHosts)
 		total += len(webProbes)
 	}
-	return &anytypeProgressState{total: total, reportFn: opts.Progress}
+	progress := &anytypeProgressState{total: total, reportFn: opts.Progress}
+	progress.reportFn(AnytypeProgress{
+		Phase: "start",
+		Total: total,
+	})
+	return progress
 }
 
 // Every completed lookup or object sync advances the shared export bar by one step.
@@ -981,7 +987,7 @@ func (c anytypeClient) mergeAssetProperties(ctx context.Context, object *anytype
 		Properties: anytypeAssetProperties(opts, engagementID, mergedAliases, asset.ScanTarget),
 	})
 	if err != nil {
-		if asset.ScanTarget != nil && isAnytypeUnknownPropertyKeyError(err) {
+		if isAnytypeUnknownPropertyKeyError(err) {
 			// Port scan status fields are optional for older Anytype templates.
 			// Keep the Asset export working when those property keys are absent.
 			_, fallbackErr := c.updateObject(ctx, object.ID, anytypeUpdateObjectRequest{
@@ -1001,7 +1007,7 @@ func (c anytypeClient) setAssetProperties(ctx context.Context, id string, opts A
 	_, err := c.updateObject(ctx, id, anytypeUpdateObjectRequest{
 		Properties: anytypeAssetProperties(opts, engagementID, aliases, scanTarget),
 	})
-	if err != nil && scanTarget != nil && isAnytypeUnknownPropertyKeyError(err) {
+	if err != nil && isAnytypeUnknownPropertyKeyError(err) {
 		// New scan-status properties should enrich Assets, not make existing
 		// Anytype spaces unusable until users add the optional fields.
 		_, err = c.updateObject(ctx, id, anytypeUpdateObjectRequest{
@@ -1069,7 +1075,7 @@ func serviceAliasPropertyKeys(value string) []string {
 }
 
 func isAnytypeUnknownPropertyKeyError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "unknown property key")
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unknown property key")
 }
 
 func (c anytypeClient) findExistingService(ctx context.Context, typeKey string, scan storage.PortScanRecord, aliases []string, engagementPropertyKey string, engagementID string) (*anytypeObject, error) {

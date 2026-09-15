@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -87,6 +88,34 @@ func TestAnytypeAssetRequiredPropertiesOmitOptionalPortScanStatus(t *testing.T) 
 	}
 	if got := propertyText(properties, "last_port_scan"); got != "" {
 		t.Fatalf("last_port_scan=%q; want omitted", got)
+	}
+}
+
+func TestAnytypeUnknownPropertyKeyDetectionMatchesBadInputMessage(t *testing.T) {
+	err := errors.New(`bad input: unknown property key: "port_scanned"`)
+	if !isAnytypeUnknownPropertyKeyError(err) {
+		t.Fatalf("expected unknown property key detection for %v", err)
+	}
+}
+
+func TestAnytypeProgressStateIncludesAssetsAndReportsStart(t *testing.T) {
+	var reports []AnytypeProgress
+	progress := newAnytypeProgressState(AnytypeOptions{
+		Progress: func(progress AnytypeProgress) {
+			reports = append(reports, progress)
+		},
+	}, 3, []storage.PortScanRecord{
+		{IP: "203.0.113.10", Port: 80, Protocol: "tcp"},
+	}, nil, nil, nil, nil)
+
+	if progress.total != 5 {
+		t.Fatalf("total=%d; want engagement + assets + service = 5", progress.total)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports=%v; want initial start report", reports)
+	}
+	if reports[0].Phase != "start" || reports[0].Completed != 0 || reports[0].Total != 5 {
+		t.Fatalf("initial report=%+v; want start 0/5", reports[0])
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"github.com/indigo-sadland/logy/internal/modules/exporter"
 	"github.com/indigo-sadland/logy/internal/storage"
 
-	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -455,7 +454,7 @@ type anytypeProgressBar struct {
 // Render live progress only in interactive terminals so JSON output stays clean.
 func newAnytypeProgressBar() *anytypeProgressBar {
 	return &anytypeProgressBar{
-		enabled: isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd()),
+		enabled: isInteractiveTerminal(os.Stderr) || isInteractiveTerminal(os.Stdout),
 	}
 }
 
